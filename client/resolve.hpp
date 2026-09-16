@@ -84,7 +84,7 @@ inline string cachePath() {
     return p + "\\resolve-cache.json";
 }
 
-constexpr long long CACHE_LAYOUT_VERSION = 3;
+constexpr long long CACHE_LAYOUT_VERSION = 4;
 struct CacheKey { u64 textHash = 0; std::size_t textSize = 0; std::uint32_t peChecksum = 0; };
 
 // name -> slot table (one place; the cache and the apply loop share it)
@@ -109,6 +109,13 @@ inline vector<Slot> slotTable() {
         {"MODEL_ANIM_GROUPS", &kk::off::MODEL_ANIM_GROUPS},
         {"NPC_GET_MODEL_ENTRY", &kk::off::NPC_GET_MODEL_ENTRY},
         {"NPC_MODEL_RESOLVER", &kk::off::NPC_MODEL_RESOLVER},
+        {"MANAGED_RELEASE_HELPER", &kk::off::MANAGED_RELEASE_HELPER},
+        {"NPC_MODEL_RESOURCE", &kk::off::NPC_MODEL_RESOURCE},
+        {"MANAGED_STRONG_COUNT", &kk::off::MANAGED_STRONG_COUNT},
+        {"MANAGED_WEAK_COUNT", &kk::off::MANAGED_WEAK_COUNT},
+        {"MANAGED_DESTROY_VTABLE", &kk::off::MANAGED_DESTROY_VTABLE},
+        {"MANAGED_DELETE_VTABLE", &kk::off::MANAGED_DELETE_VTABLE},
+        {"NPC_MODEL_ENTRY_SLOT", &kk::off::NPC_MODEL_ENTRY_SLOT},
         {"CLIENT_OBJ_PTR", &kk::off::CLIENT_OBJ_PTR},
         {"VARP_ARRAY_PTR", &kk::off::VARP_ARRAY_PTR},
         {"CONTAINER_BUCKETS", &kk::off::CONTAINER_BUCKETS},
@@ -204,8 +211,17 @@ inline bool validateRuntimeModelLayout(const ModuleMap& M, vector<string>& lines
         off::MODEL_VERTEX_COUNT = off::MODEL_VERTEX_X = 0;
         off::MODEL_VERTEX_Y = off::MODEL_VERTEX_Z = off::MODEL_ANIM_GROUPS = 0;
         off::NPC_GET_MODEL_ENTRY = off::NPC_MODEL_RESOLVER = 0;
+        off::MANAGED_RELEASE_HELPER = 0;
+        off::NPC_MODEL_RESOURCE = 0;
+        off::MANAGED_STRONG_COUNT = off::MANAGED_WEAK_COUNT = 0;
+        off::MANAGED_DESTROY_VTABLE = off::MANAGED_DELETE_VTABLE = 0;
+        off::NPC_MODEL_ENTRY_SLOT = 0;
         layout::set(layout::Field::RuntimeModelGeometry, layout::State::Unavailable,
                     "RuntimeModel structural validation failed");
+        layout::set(layout::Field::NpcCurrentModel, layout::State::Unavailable,
+                    "RuntimeModel acquisition validation failed");
+        layout::set(layout::Field::PlayerCurrentModel, layout::State::Unavailable,
+                    "Player model acquisition is not proven");
     };
     auto fail = [&](const char* why) {
         lines.push_back(string("MODEL-FAIL ") + why);
@@ -228,6 +244,12 @@ inline bool validateRuntimeModelLayout(const ModuleMap& M, vector<string>& lines
         return fail("animation target mismatch");
     if (off::RUNTIME_MODEL_SCALE && scale != M.base + off::RUNTIME_MODEL_SCALE)
         return fail("scale target mismatch");
+    if (!off::MANAGED_RELEASE_HELPER || !M.isText(M.base + off::MANAGED_RELEASE_HELPER))
+        return fail("managed release helper is not executable");
+    if (off::NPC_MODEL_RESOURCE != 0x728 || off::MANAGED_STRONG_COUNT != 0x8 ||
+        off::MANAGED_WEAK_COUNT != 0xC || off::MANAGED_DESTROY_VTABLE != 0x8 ||
+        off::MANAGED_DELETE_VTABLE != 0x10 || off::NPC_MODEL_ENTRY_SLOT != 0)
+        return fail("unexpected model ownership layout");
     if (off::MODEL_VERTEX_COUNT != 0x28 || off::MODEL_VERTEX_X != 0x40 ||
         off::MODEL_VERTEX_Y != 0x58 || off::MODEL_VERTEX_Z != 0x70)
         return fail("unexpected vertex layout");
@@ -476,9 +498,12 @@ inline bool init(uptr base) {
 
     if (detail::cacheLoad(key, lines)) {
         detail::cacheSavedBuildMatch = true;
-        if (detail::validateRuntimeModelLayout(M, lines))
+        if (detail::validateRuntimeModelLayout(M, lines)) {
             layout::set(layout::Field::RuntimeModelGeometry, layout::State::Resolved,
                         "per-build cache: RuntimeModel geometry");
+            layout::set(layout::Field::NpcCurrentModel, layout::State::Resolved,
+                        "per-build cache: NPC actor model bridge");
+        }
         validateLive(base, lines);
         reportLines(lines);
         return true;
@@ -893,8 +918,21 @@ inline bool init(uptr base) {
         off::MODEL_ANIM_GROUPS = 0x1B8;
         off::NPC_GET_MODEL_ENTRY = 0xA4D80;
         off::NPC_MODEL_RESOLVER = 0x5CEF80;
+        off::MANAGED_RELEASE_HELPER = 0x44D30;
+        off::NPC_MODEL_RESOURCE = 0x728;
+        off::MANAGED_STRONG_COUNT = 0x8;
+        off::MANAGED_WEAK_COUNT = 0xC;
+        off::MANAGED_DESTROY_VTABLE = 0x8;
+        off::MANAGED_DELETE_VTABLE = 0x10;
+        off::NPC_MODEL_ENTRY_SLOT = 0;
         lines.push_back("COMPAT    exact 240-7 RuntimeModel values installed as RVAs");
-        detail::validateRuntimeModelLayout(M, lines);
+        if (detail::validateRuntimeModelLayout(M, lines)) {
+            // The same actor virtual entry is used by the proven NPC path. Player
+            // acquisition remains disabled until a player-side call path is
+            // independently observed.
+            layout::set(layout::Field::NpcCurrentModel, layout::State::Validated,
+                        "240-7 NPC actor model bridge + managed release path");
+        }
     }
 
     // ---- install: live-validate, cache, report ------------------------------

@@ -43,6 +43,8 @@ constexpr int MAX_PLUGINS            = 64;
 constexpr int MAX_SETTINGS_PER_PLUGIN = 256;
 constexpr int MAX_PROFILES           = 32;
 constexpr int MAX_HUB                = 64;
+constexpr int MAX_DEBUG_LINES         = 192;
+constexpr std::size_t DEBUG_LINE      = 256;
 
 enum EditKind : std::int32_t {
     EDIT_BOOL = 0,

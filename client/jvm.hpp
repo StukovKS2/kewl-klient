@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include "game.hpp"
+#include "model_geometry.hpp"
 #include "overlay.hpp"
 #include "panel.hpp"
 
@@ -110,6 +111,98 @@ inline jboolean JNICALL nReady(JNIEnv*, jclass) {
 /// One array rather than one object per entity on purpose -- this is called thirty times a second, and
 /// allocating a few hundred short-lived objects a frame is exactly the kind of thing that turns into a
 /// stutter you then spend an evening profiling. Java unpacks it into records once.
+inline jintArray JNICALL nModelHull(JNIEnv* env, jclass, jint uid, jboolean player) {
+    struct ModelReportAtExit { ~ModelReportAtExit() { model::maybeReport(); } } report;
+    // The player-side accessor is not independently proven yet. Keep player
+    // highlights on their existing prism rather than sharing an NPC guess.
+    if (player == JNI_TRUE) return env->NewIntArray(0);
+    bool found = false;
+    const Entity entity = findEntity(uid, false, found);
+    if (!found || !layout::npcModelHighlights()) return env->NewIntArray(0);
+
+    model::CurrentModelRef current;
+    if (!model::currentForEntity(model::EntityKind::Npc, entity.addr, current))
+        return env->NewIntArray(0);
+
+    model::Snapshot snapshot;
+    const bool copied = model::snapshot(moduleBase(), current.model, snapshot);
+    if (!copied) model::note(model::AcquireFailure::SnapshotFailed);
+    const bool released = model::releaseManaged(current.control);
+    (void)released;
+    if (!copied) return env->NewIntArray(0);
+
+    model::EntityPose pose{
+        static_cast<float>(entity.fineX), static_cast<float>(entity.fineY),
+        static_cast<float>(entity.fineH), entity.orientation
+    };
+    std::vector<model::ScreenPoint> hull;
+    const bool projected = model::projectSnapshot(
+        snapshot, pose,
+        [](float x, float h, float y, model::ScreenPoint& out) {
+            float sx = 0.0f, sy = 0.0f;
+            if (!projectFine(static_cast<int>(std::lround(x)),
+                             static_cast<int>(std::lround(h)),
+                             static_cast<int>(std::lround(y)), sx, sy))
+                return false;
+            out = { sx, sy };
+            return true;
+        }, hull);
+    if (!projected) {
+        model::note(model::AcquireFailure::ProjectionFailed);
+        return env->NewIntArray(0);
+    }
+    model::note(model::AcquireFailure::Success);
+
+    std::vector<jint> flat;
+    flat.reserve(hull.size() * 2);
+    for (const auto& p : hull) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+        flat.push_back(static_cast<jint>(std::lround(p.x)));
+        flat.push_back(static_cast<jint>(std::lround(p.y)));
+    }
+    if (flat.size() < 6) return env->NewIntArray(0);
+    jintArray result = env->NewIntArray(static_cast<jsize>(flat.size()));
+    if (result) env->SetIntArrayRegion(result, 0, static_cast<jsize>(flat.size()), flat.data());
+    return result;
+}
+
+/// Resolver diagnostics as a flat int array: {fieldCount, per field: state, ...} plus model
+/// geometry counters. The launcher reads this through PanelBridge.debugLines().
+inline jintArray JNICALL nResolverDiagnostics(JNIEnv* env, jclass) {
+    // 13 fields * 2 (state + source-length encoded) + 6 model counters + header = 33 ints max
+    jint v[48];
+    int n = 0;
+    namespace lay = layout;
+    auto putState = [&](lay::Field f) {
+        const auto& rec = lay::get(f);
+        v[n++] = static_cast<jint>(rec.state);
+    };
+    // Field states
+    putState(lay::Field::ClientObject);
+    putState(lay::Field::VarpArray);
+    putState(lay::Field::GameState);
+    putState(lay::Field::Registry);
+    putState(lay::Field::EntityScene);
+    putState(lay::Field::EntityDefinition);
+    putState(lay::Field::EntityPlane);
+    putState(lay::Field::PlayerName);
+    putState(lay::Field::Projection);
+    putState(lay::Field::Camera);
+    putState(lay::Field::RuntimeModelGeometry);
+    putState(lay::Field::NpcCurrentModel);
+    putState(lay::Field::PlayerCurrentModel);
+    // Model geometry counters from kk::model::diagnostics
+    v[n++] = static_cast<jint>(model::diagnostics.attempts.load());
+    v[n++] = static_cast<jint>(model::diagnostics.acquired.load());
+    v[n++] = static_cast<jint>(model::diagnostics.success.load());
+    v[n++] = static_cast<jint>(model::diagnostics.capabilityUnavailable.load());
+    v[n++] = static_cast<jint>(model::diagnostics.snapshotFailed.load());
+    v[n++] = static_cast<jint>(model::diagnostics.projectionFailed.load());
+    jintArray arr = env->NewIntArray(static_cast<jsize>(n));
+    if (arr) env->SetIntArrayRegion(arr, 0, static_cast<jsize>(n), v);
+    return arr;
+}
+
 inline jintArray JNICALL nEntities(JNIEnv* env, jclass) {
     std::vector<jint> flat;
     flat.reserve(256 * 10);
@@ -1352,6 +1445,7 @@ inline bool startJvm(const std::wstring& javaHome, const std::wstring& jarPath, 
     const JNINativeMethod natives[] = {
         { const_cast<char*>("ready"),       const_cast<char*>("()Z"),     reinterpret_cast<void*>(nReady) },
         { const_cast<char*>("entities"),    const_cast<char*>("()[I"),    reinterpret_cast<void*>(nEntities) },
+        { const_cast<char*>("modelHull"),    const_cast<char*>("(IZ)[I"),   reinterpret_cast<void*>(nModelHull) },
         { const_cast<char*>("sceneBase"),   const_cast<char*>("()[I"),    reinterpret_cast<void*>(nSceneBase) },
         { const_cast<char*>("varp"),        const_cast<char*>("(I)I"),    reinterpret_cast<void*>(nVarp) },
         { const_cast<char*>("container"),   const_cast<char*>("(I)[I"),   reinterpret_cast<void*>(nContainer) },

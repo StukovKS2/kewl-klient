@@ -191,7 +191,9 @@ EXPECT = {
     'runtimeModelScale': 0x6442C0,
     'modelVertexCount': 0x28, 'modelVertexX': 0x40,
     'modelVertexY': 0x58, 'modelVertexZ': 0x70, 'modelAnimGroups': 0x1B8,
-    'npcGetModelEntry': 0xA4D80, 'npcModelResolver': 0x5CEF80,
+    'npcGetModelEntry': 0xA4D80, 'npcModelResolver': 0x5CEF80, 'managedReleaseHelper': 0x44D30,
+    'npcModelResource': 0x728, 'managedStrongCount': 0x8, 'managedWeakCount': 0xC,
+    'managedDestroyVtable': 0x8, 'managedDeleteVtable': 0x10, 'npcModelEntrySlot': 0,
 }
 
 FUNCS = {
@@ -214,7 +216,9 @@ for key, value in {
     'runtimeModelScale': 0x6442C0, 'modelVertexCount': 0x28,
     'modelVertexX': 0x40, 'modelVertexY': 0x58, 'modelVertexZ': 0x70,
     'modelAnimGroups': 0x1B8, 'npcGetModelEntry': 0xA4D80,
-    'npcModelResolver': 0x5CEF80,
+    'npcModelResolver': 0x5CEF80, 'managedReleaseHelper': 0x44D30,
+    'npcModelResource': 0x728, 'managedStrongCount': 0x8, 'managedWeakCount': 0xC,
+    'managedDestroyVtable': 0x8, 'managedDeleteVtable': 0x10, 'npcModelEntrySlot': 0,
 }.items():
     good = EXPECT[key] == value
     print(f"exact 240-7: {key} = {hex(EXPECT[key])}", 'OK' if good else 'FAIL')

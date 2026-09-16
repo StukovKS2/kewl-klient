@@ -45,6 +45,52 @@ public class OverlayUtil
 	{
 	}
 
+	/** The dark under-stroke colour. Opaque enough to read over bright scenery, not a black band. */
+	private static final Color OUTLINE_SHADOW = new Color(0, 0, 0, 180);
+
+	/**
+	 * {@link #renderPolygon} with a silhouette instead of a bare stroke: a dark under-stroke two
+	 * pixels wider, then the fill, then the colour on top.
+	 *
+	 * <p>NOT upstream. The hull on this build is {@code Perspective.approximateHull}'s tile prism
+	 * (there is no model access), so the shape's outline is the only cue the eye gets -- and a 1-2px
+	 * stroke in a saturated colour vanishes against grass, sand or a lit wall. Drawing the shadow
+	 * first means the border reads at any background without raising the fill opacity, which is what
+	 * washes out whatever is standing behind the actor.</p>
+	 *
+	 * <p>{@link #renderPolygon} is left exactly as upstream: tiles and the other ported plugins keep
+	 * calling it and should keep looking the way RuneLite draws them.</p>
+	 */
+	public static void renderOutlinedPolygon(Graphics2D graphics, Shape poly, Color color,
+		Color fillColor, Stroke borderStroke)
+	{
+		if (poly == null)
+		{
+			return;
+		}
+		final Stroke originalStroke = graphics.getStroke();
+		final float width = borderStroke instanceof BasicStroke
+			? ((BasicStroke) borderStroke).getLineWidth()
+			: 2f;
+
+		// Round caps/joins: the prism hull has sharp corners, and mitred joins on a widened stroke
+		// throw spikes well past the shape at acute angles.
+		graphics.setStroke(new BasicStroke(width + 2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+		graphics.setColor(OUTLINE_SHADOW);
+		graphics.draw(poly);
+
+		if (fillColor != null && fillColor.getAlpha() > 0)
+		{
+			graphics.setColor(fillColor);
+			graphics.fill(poly);
+		}
+
+		graphics.setStroke(new BasicStroke(width, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+		graphics.setColor(color);
+		graphics.draw(poly);
+		graphics.setStroke(originalStroke);
+	}
+
 	public static void renderPolygon(Graphics2D graphics, Shape poly, Color color)
 	{
 		renderPolygon(graphics, poly, color, new BasicStroke(2));

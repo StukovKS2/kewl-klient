@@ -16,9 +16,12 @@ param(
     [switch]$KeepDatabase
 )
 
-$exe = Join-Path $Ida "idat64.exe"          # idat64 is the console build; ida64.exe would open a window
+# idat is the console build; ida.exe would open a window. IDA 9 renamed idat64.exe to
+# idat.exe (one binary, 64-bit); accept either so older installs keep working.
+$exe = Join-Path $Ida "idat.exe"
+if (-not (Test-Path $exe)) { $exe = Join-Path $Ida "idat64.exe" }
 if (-not (Test-Path $exe)) {
-    Write-Error "idat64.exe not found under $Ida"
+    Write-Error "neither idat.exe nor idat64.exe found under $Ida"
     exit 1
 }
 

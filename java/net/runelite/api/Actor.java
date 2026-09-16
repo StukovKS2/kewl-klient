@@ -2,9 +2,10 @@
 // kewl.api.Entity / kewl.api.Local expose, so NPC and Player share every projection helper.
 //
 // What is real here: position (scene tile, fine render position, ground height under the actor),
-// animation, orientation, name. What is approximated, and says so in its javadoc: the convex hull
-// (no model access on this build), the logical height (a tuning constant), the plane (the local
-// player's -- no per-entity plane is exported by nEntities). What is an honest default: combat level
+// animation, orientation, name. What is approximated, and says so in its javadoc: the convex-hull
+// fallback (the validated NPC model path can now replace it; unsupported/player paths fall back), the
+// logical height (a tuning constant), the plane (the local player's -- no per-entity plane is exported
+// by nEntities). What is an honest default: combat level
 // 0, no interacting target, no health bar, no overhead text, no graphic.
 package net.runelite.api;
 
@@ -287,15 +288,39 @@ public abstract class Actor
 	}
 
 	/**
-	 * AN APPROXIMATION. There is no model or hull access on this build (no model offsets are
-	 * derived), so this is the 2D convex hull of a prism standing on the actor's footprint: size x
-	 * size tiles wide at its ground height, {@link #getLogicalHeight()} tall. Every corner goes
-	 * through the game's own projection, so the shape rotates and foreshortens with the camera by
-	 * construction. Null when fewer than three corners are on screen.
+	 * Returns the 2D convex hull of the current animated NPC RuntimeModel when the validated native
+	 * capability is available. Model acquisition, snapshotting, projection, and hull failures fall back
+	 * to the legacy prism approximation: size x size tiles wide at the actor's ground height,
+	 * {@link #getLogicalHeight()} tall. Player and unsupported-build paths intentionally use that
+	 * fallback. Null when fewer than three corners are on screen.
 	 */
 	@Nullable
 	public Shape getConvexHull()
 	{
+		// Prefer the copied, current animated NPC model hull when the native
+		// capability is available. Empty/error results deliberately fall back to
+		// the existing prism so overlays never disappear on unsupported builds.
+		try
+		{
+			int[] points = kewl.Natives.modelHull(uid(), this instanceof NPC);
+			if (points != null && points.length >= 6 && (points.length & 1) == 0)
+			{
+				Polygon modelHull = new Polygon();
+				for (int i = 0; i < points.length; i += 2)
+				{
+					modelHull.addPoint(points[i], points[i + 1]);
+				}
+				if (modelHull.npoints >= 3)
+				{
+					return modelHull;
+				}
+			}
+		}
+		catch (UnsatisfiedLinkError ignored)
+		{
+			// Unit tests and older jars may not have the optional native yet.
+		}
+
 		LocalPoint lp = getLocalLocation();
 		return Perspective.approximateHull(lp.getX(), lp.getY(), height(), size(), getLogicalHeight());
 	}

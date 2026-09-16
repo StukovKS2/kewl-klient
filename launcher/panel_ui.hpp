@@ -311,6 +311,7 @@ struct Model {
     std::vector<PluginModel>* plugins = nullptr;    // mutable: the optimistic echo writes here
     std::vector<ProfileModel>* profiles = nullptr;  // ditto
     std::vector<HubEntry>* hub = nullptr;           // ditto
+    std::vector<std::string>* debugLines = nullptr; // native offsets/runtime diagnostics from the DLL
     std::int32_t* activeProfile = nullptr;          // ditto: index into *profiles, -1 = none
     std::int32_t* hubState = nullptr;               // ditto: kewl_bridge::HubState
     std::string* hubError = nullptr;                // ditto: one line, when *hubState == HUB_ERROR
@@ -333,6 +334,15 @@ void draw(const Model& m, const EditSink& edit);
 // make the config view dumpable -- and a view that only a mouse could reach is a view that never
 // gets verified. Out of range is a no-op, so a caller cannot wedge the UI with it.
 void debugPushConfig(int pluginIdx);
+
+// The diagnostics view is a separate top-level window because an ImGui popup inside the launcher
+// cannot cover the embedded game HWND (child HWNDs are always composited above their parent).
+inline bool& nativeDiagnosticsRequest() { static bool v = false; return v; }
+inline bool takeNativeDiagnosticsRequest() {
+    bool requested = nativeDiagnosticsRequest();
+    nativeDiagnosticsRequest() = false;
+    return requested;
+}
 
 // =================================================================================================
 // Implementation. Header-only because launcher/main.cpp is the only TU that includes it -- the same
@@ -1598,6 +1608,14 @@ inline void debugView(const Model& m) {
         if (ImGui::IsMouseHoveringRect(top, ImVec2(top.x + avail, top.y + ROW_H)) && tooltipsAllowed())
             ImGui::SetTooltip("transitions arrive immediately instead of travelling");
     }
+    ImGui::Dummy(ImVec2(0, SP_2));
+
+    // Native diagnostics are deliberately a popout: the full offset table is large and should not
+    // consume the narrow 250px developer panel. The popup is opened on demand and has its own scroll.
+    if (pressButton("##open-native-diagnostics", "DLL diagnostics...", ImVec2(avail, ROW_H)))
+        nativeDiagnosticsRequest() = true;
+    if (tooltipsAllowed() && ImGui::IsItemHovered())
+        ImGui::SetTooltip("open the DLL's live runtime layout and every resolved offset");
     ImGui::Dummy(ImVec2(0, SP_2));
 
     // ---- bridge state ----------------------------------------------------------------------------

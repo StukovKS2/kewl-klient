@@ -154,7 +154,8 @@ public class PlayerIndicatorsOverlay extends Overlay
 			Shape convexHull = actor.getConvexHull();
 			if (convexHull != null)
 			{
-				OverlayUtil.renderPolygon(graphics, convexHull, color, fill, stroke);
+				// Outlined: matches the NPC hull, which is the same prism approximation.
+				OverlayUtil.renderOutlinedPolygon(graphics, convexHull, color, fill, stroke);
 			}
 		}
 		if (tile)

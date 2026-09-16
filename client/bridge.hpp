@@ -127,6 +127,7 @@
 // ------------------------------------------------------------------------------------------------
 #pragma once
 #include <windows.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -134,6 +135,7 @@
 #include <string>
 #include <vector>
 #include "jvm.hpp"
+#include "diagnostics.hpp"
 
 namespace kk::bridge {
 
@@ -154,6 +156,8 @@ constexpr int MAX_OPTIONS = 8;
 // guard the plugin/setting caps already are.
 constexpr int MAX_PROFILES = 32;
 constexpr int MAX_HUB      = 64;
+constexpr int MAX_DEBUG_LINES = 192;
+constexpr std::size_t DEBUG_LINE = 256;
 
 // The edit kinds, in the order the table in the layout comment above lists them. Values are part of
 // the contract: the launcher writes the number, the DLL's dispatch switches on it.
@@ -242,7 +246,8 @@ static_assert(MODEL_OFFSET % 8 == 0, "bridge contract: the model region is 8-ali
 // The reader's sanity caps, pinned so a future edit cannot quietly widen one past what Reader::count
 // (and the launcher's matching guard) is willing to believe.
 static_assert(MAX_PLUGINS <= 64 && MAX_SETTINGS_PER_PLUGIN <= 256 && MAX_PROFILES <= 64 &&
-              MAX_HUB <= 64, "bridge contract: caps must stay within the reader's sanity bounds");
+              MAX_HUB <= 64 && MAX_DEBUG_LINES <= 256,
+              "bridge contract: caps must stay within the reader's sanity bounds");
 
 // ------------------------------------------------------------------------------------------------
 // UTF-8 helpers. Java hands the snapshot over as standard UTF-8 (PanelBridge packs
@@ -460,6 +465,16 @@ inline bool buildModel(std::vector<std::uint8_t>& out, const std::vector<jint>& 
     return true;
 }
 
+// Native diagnostics are appended after the Java-owned model. They do not change the Java snapshot
+// format and an older launcher safely ignores the tail; a matching launcher displays it on demand.
+inline void appendDiagnostics(std::vector<std::uint8_t>& out) {
+    const auto lines = kk::diagnostics::lines();
+    const std::size_t count = (std::min)(lines.size(), static_cast<std::size_t>(MAX_DEBUG_LINES));
+    putI32(out, static_cast<std::int32_t>(count));
+    for (std::size_t i = 0; i < count; ++i)
+        putField(out, lines[i], DEBUG_LINE);
+}
+
 // ------------------------------------------------------------------------------------------------
 // The server: the mapping, the mutex and the hidden window that receives edit notifications.
 // ------------------------------------------------------------------------------------------------
@@ -613,6 +628,7 @@ inline bool publishModel(std::int64_t revision) {
         }
         return false;
     }
+    appendDiagnostics(bytes);
     g_rejected = false;
     if (bytes.size() > MODEL_BYTES) return false;   // cannot happen within the caps; guarded regardless
 

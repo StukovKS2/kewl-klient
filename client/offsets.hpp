@@ -66,6 +66,13 @@ inline std::uintptr_t MODEL_ANIM_GROUPS  = 0;
 // until its managed-pair ABI and ownership semantics are recovered.
 inline std::uintptr_t NPC_GET_MODEL_ENTRY = 0;
 inline std::uintptr_t NPC_MODEL_RESOLVER  = 0;
+inline std::uintptr_t MANAGED_RELEASE_HELPER = 0;
+inline std::uintptr_t NPC_MODEL_RESOURCE = 0;
+inline std::uintptr_t MANAGED_STRONG_COUNT = 0;
+inline std::uintptr_t MANAGED_WEAK_COUNT = 0;
+inline std::uintptr_t MANAGED_DESTROY_VTABLE = 0;
+inline std::uintptr_t MANAGED_DELETE_VTABLE = 0;
+inline std::uintptr_t NPC_MODEL_ENTRY_SLOT = 0;
 
 // ---------------------------------------------------------------------------
 // THE ROOT POINTER + GLOBALS (RVAs from module base).

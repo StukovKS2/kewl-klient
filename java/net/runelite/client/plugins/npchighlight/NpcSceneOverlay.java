@@ -116,7 +116,8 @@ public class NpcSceneOverlay extends Overlay
 			Shape objectClickbox = actor.getConvexHull();
 			if (objectClickbox != null)
 			{
-				OverlayUtil.renderPolygon(graphics, objectClickbox, borderColor, fillColor, stroke);
+				// Outlined: the hull is a tile prism, so its silhouette carries the whole cue.
+				OverlayUtil.renderOutlinedPolygon(graphics, objectClickbox, borderColor, fillColor, stroke);
 			}
 		}
 

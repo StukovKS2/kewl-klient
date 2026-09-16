@@ -32,6 +32,14 @@ public final class Natives {
      */
     public static native int[] entities();
 
+    /**
+     * Current animated NPC model hull as flattened screen coordinates
+     * {@code {x0, y0, x1, y1, ...}}. Empty when model acquisition or
+     * validation is unavailable; player requests intentionally remain empty
+     * until a separate player model path is proven.
+     */
+    public static native int[] modelHull(int uid, boolean player);
+
     /** {@code {worldX, worldY}} of the loaded scene's south-west corner. Empty when nothing is loaded. */
     public static native int[] sceneBase();
 

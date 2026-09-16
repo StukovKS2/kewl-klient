@@ -297,7 +297,107 @@ Bridge g_bridge;
 std::vector<PluginModel> g_plugins;         // the last parsed model snapshot
 std::vector<kewl_panel::ProfileModel> g_profiles;
 std::vector<kewl_panel::HubEntry> g_hub;
+std::vector<std::string> g_debugLines;
+HWND g_diagnosticsWindow = nullptr;
+int g_diagnosticsScroll = 0;
 std::int32_t g_activeProfile = -1;
+
+LRESULT CALLBACK diagnosticsProc(HWND h, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(h, &ps);
+        RECT client{};
+        GetClientRect(h, &client);
+        FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(225, 225, 235));
+        HFONT font = static_cast<HFONT>(GetStockObject(ANSI_FIXED_FONT));
+        HFONT old = static_cast<HFONT>(SelectObject(dc, font));
+        const int lineHeight = 16;
+        const int visible = (std::max)(1, static_cast<int>((client.bottom - client.top) / lineHeight));
+        const int maxScroll = (std::max)(0, static_cast<int>(g_debugLines.size()) - visible);
+        g_diagnosticsScroll = (std::min)(g_diagnosticsScroll, maxScroll);
+        for (int i = g_diagnosticsScroll; i < static_cast<int>(g_debugLines.size()); ++i) {
+            const int y = (i - g_diagnosticsScroll) * lineHeight;
+            if (y >= client.bottom) break;
+            const std::wstring text = wide(g_debugLines[static_cast<std::size_t>(i)]);
+            TextOutW(dc, 8, y + 1, text.c_str(), static_cast<int>(text.size()));
+        }
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        g_diagnosticsScroll -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * 3;
+        RECT client{};
+        GetClientRect(h, &client);
+        const int visible = (std::max)(1, static_cast<int>((client.bottom - client.top) / 16));
+        const int maxScroll = (std::max)(0, static_cast<int>(g_debugLines.size()) - visible);
+        g_diagnosticsScroll = (std::max)(0, (std::min)(g_diagnosticsScroll, maxScroll));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_VSCROLL: {
+        RECT client{};
+        GetClientRect(h, &client);
+        const int visible = (std::max)(1, static_cast<int>((client.bottom - client.top) / 16));
+        const int maxScroll = (std::max)(0, static_cast<int>(g_debugLines.size()) - visible);
+        switch (LOWORD(wParam)) {
+            case SB_LINEUP: --g_diagnosticsScroll; break;
+            case SB_LINEDOWN: ++g_diagnosticsScroll; break;
+            case SB_PAGEUP: g_diagnosticsScroll -= visible; break;
+            case SB_PAGEDOWN: g_diagnosticsScroll += visible; break;
+            case SB_THUMBPOSITION:
+            case SB_THUMBTRACK: g_diagnosticsScroll = HIWORD(wParam); break;
+            case SB_TOP: g_diagnosticsScroll = 0; break;
+            case SB_BOTTOM: g_diagnosticsScroll = maxScroll; break;
+        }
+        g_diagnosticsScroll = (std::max)(0, (std::min)(g_diagnosticsScroll, maxScroll));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:
+        ShowWindow(h, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        g_diagnosticsWindow = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(h, message, wParam, lParam);
+}
+
+void showDiagnosticsWindow() {
+    if (!g_diagnosticsWindow) {
+        static const wchar_t className[] = L"KewlKlientDiagnostics";
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSEXW wc{ sizeof wc };
+            wc.lpfnWndProc = diagnosticsProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(IDC_ARROW));
+            wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            wc.lpszClassName = className;
+            RegisterClassExW(&wc);
+            registered = true;
+        }
+        g_diagnosticsWindow = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, className, L"KewlKlient - DLL diagnostics",
+            WS_OVERLAPPEDWINDOW | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT, 720, 700,
+            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    if (!g_diagnosticsWindow) return;
+    g_diagnosticsScroll = 0;
+    ShowWindow(g_diagnosticsWindow, SW_SHOW);
+    SetWindowPos(g_diagnosticsWindow, HWND_TOPMOST, 80, 80, 720, 700,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_diagnosticsWindow, nullptr, TRUE);
+}
+
+void refreshDiagnosticsWindow() {
+    if (g_diagnosticsWindow && IsWindowVisible(g_diagnosticsWindow))
+        InvalidateRect(g_diagnosticsWindow, nullptr, FALSE);
+}
 std::int32_t g_hubState = kewl_bridge::HUB_IDLE;
 std::string g_hubError;
 std::int64_t g_modelRevision = -1;          // the revision g_plugins was built from
@@ -417,6 +517,17 @@ bool readModel(const unsigned char* p, const unsigned char* end, std::int64_t re
         hub.push_back(std::move(he));
     }
 
+    // Optional native diagnostics appended by the DLL after the Java-owned model. A zero count is
+    // also the compatibility shape for an older DLL or a fake model without runtime diagnostics.
+    std::vector<std::string> debugLines;
+    if (r.ok && r.p < r.end) {
+        int debugCount = r.i32();
+        if (debugCount < 0 || debugCount > kewl_bridge::MAX_DEBUG_LINES) return false;
+        debugLines.reserve(debugCount);
+        for (int i = 0; i < debugCount && r.ok; ++i)
+            debugLines.push_back(r.str(kewl_bridge::DEBUG_LINE));
+    }
+
     if (!r.ok) return false;                        // truncated region: keep the previous snapshot
     // An active index outside the list it indexes is not a model we understand either: everything
     // after it parsed, but the profiles block is already lying, and the profiles view would trust it.
@@ -425,6 +536,7 @@ bool readModel(const unsigned char* p, const unsigned char* end, std::int64_t re
     g_plugins = std::move(next);
     g_profiles = std::move(profiles);
     g_hub = std::move(hub);
+    g_debugLines = std::move(debugLines);
     g_activeProfile = activeProfile;
     g_hubState = hubState;
     g_hubError = std::move(hubError);
@@ -1079,6 +1191,7 @@ void drawPanel() {
     m.plugins       = &g_plugins;
     m.profiles      = &g_profiles;
     m.hub           = &g_hub;
+    m.debugLines    = &g_debugLines;
     m.activeProfile = &g_activeProfile;
     m.hubState      = &g_hubState;
     m.hubError      = &g_hubError;
@@ -1095,8 +1208,11 @@ void drawPanel() {
         // ignore the key -- is routed by the DLL through the owning manager.
         writeEdit(kind, pluginIdx, key, intVal, text);
     });
+    if (kewl_panel::takeNativeDiagnosticsRequest()) showDiagnosticsWindow();
+    refreshDiagnosticsWindow();
 
-    // Keyboard handoff for the panel's text fields. The game child owns focus (the DLL holds it on
+    // Keyboard handoff for the panel's text fields.
+    // The game child owns focus (the DLL holds it on
     // JagRenderView), so a field that never asked would silently type into the game -- and the DLL
     // re-focuses the render view on every WM_ACTIVATE, including the one our own click just caused,
     // so a one-shot SetFocus would lose that race. Hence: take focus when a field activates, keep

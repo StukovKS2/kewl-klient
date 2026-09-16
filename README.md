@@ -547,6 +547,8 @@ did (`tools/wine_inject.exe` does the injecting on Linux). Same plugins, same se
 
 More on all of this: [`docs/architecture-after.md`](docs/architecture-after.md) is the architecture
 map, [`docs/plugin-system.md`](docs/plugin-system.md) covers plugins, config, profiles and the hub,
+[`docs/api-reference.md`](docs/api-reference.md) is the `kewl.api` reference for plugin authors --
+every class, its guarantees, and its known limitations on the current build --
 and [`docs/testing.md`](docs/testing.md) is what is tested and how to verify the rest by hand.
 
 The overlay is a **transparent always-on-top window**, not a renderer hook. Hooking would need a detour

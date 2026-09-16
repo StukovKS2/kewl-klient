@@ -6,6 +6,10 @@ below asks a plugin author to write UI, annotations, manifests, or lifecycle boi
 place the outside world is allowed to be complicated is the hub's manifest, and that is somebody
 else's file, not your plugin's.
 
+For the world and act surface a plugin body calls — `Game`, `Entity`, `Npcs`, `Actions`, `Input`,
+`Widgets`, `Skills` and the rest of `kewl.api` — see [api-reference.md](api-reference.md), which
+documents each class's guarantees and known limitations on the current build.
+
 ---
 
 ## 1. A built-in plugin
@@ -119,6 +123,8 @@ stays short:
 | `hotkey()` | `-1` | 0..7 = F1..F8; duplicates are allowed and both toggle |
 | `developer()` | `false` | test rigs and worked examples: both panels sort them last, under a collapsed "Developer" heading. Override it, or call `markDeveloper()` on the instance in the registry |
 | `status()` | `""` | a short line for the panel's status column |
+
+---
 
 ## 2. Config: every setting type
 

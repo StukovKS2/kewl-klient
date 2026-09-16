@@ -32,6 +32,9 @@ osclient.exe
 discord_game_sdk.dll
 /game/
 
+# local reverse-engineering Python environment
+.headless-ida-venv/
+
 # editors
 .vs/
 .idea/
