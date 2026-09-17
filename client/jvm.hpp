@@ -166,10 +166,112 @@ inline jintArray JNICALL nModelHull(JNIEnv* env, jclass, jint uid, jboolean play
     return result;
 }
 
+
+inline jstring gameBytesToJString(JNIEnv* env, const std::string& s);
+
+/// Every currently loaded scene Loc, flattened as five ints per record:
+///     id, sceneX, sceneY, plane, category
+///
+/// GameObjects are deduplicated by their scene-record pointer before serialization, so a multi-tile
+/// tree appears once even though the client stores that same GameObject in every covered SceneTile.
+/// Empty is a normal result while no scene is loaded or when the exact Loc scene layout is unavailable.
+inline jintArray JNICALL nObjects(JNIEnv* env, jclass) {
+    if (!layout::available(layout::Field::LocScene)) return env->NewIntArray(0);
+
+    std::vector<jint> flat;
+    flat.reserve(512 * 5);
+    forEachSceneLoc([&](const SceneLoc& loc) {
+        if (loc.id < 0 || loc.sceneX < 0 || loc.sceneX >= 128 ||
+            loc.sceneY < 0 || loc.sceneY >= 128 || loc.plane < 0 || loc.plane > 3) return;
+        flat.push_back(static_cast<jint>(loc.id));
+        flat.push_back(static_cast<jint>(loc.sceneX));
+        flat.push_back(static_cast<jint>(loc.sceneY));
+        flat.push_back(static_cast<jint>(loc.plane));
+        flat.push_back(static_cast<jint>(loc.category));
+    });
+
+    jintArray result = env->NewIntArray(static_cast<jsize>(flat.size()));
+    if (result && !flat.empty())
+        env->SetIntArrayRegion(result, 0, static_cast<jsize>(flat.size()), flat.data());
+    return result;
+}
+
+
+/// Resolve a LocType's immutable display name by object id. The LocType cache returns a managed pair;
+/// retain it while copying the NxtString at +0x40, then release immediately. Empty is a normal result
+/// for an invalid id or when this exact-build definition path is unavailable.
+inline jstring JNICALL nObjectName(JNIEnv* env, jclass, jint id) {
+    if (id < 0 || !off::LOC_TYPE_GET || off::LOC_TYPE_NAME != 0x40 ||
+        !layout::available(layout::Field::LocScene))
+        return env->NewStringUTF("");
+
+    using GetLocType = std::uintptr_t* (__fastcall*)(int);
+    auto getLocType = reinterpret_cast<GetLocType>(moduleBase() + off::LOC_TYPE_GET);
+    std::uintptr_t* pair = getLocType(static_cast<int>(id));
+    if (!pair || !readable(reinterpret_cast<std::uintptr_t>(pair), sizeof(std::uintptr_t) * 2))
+        return env->NewStringUTF("");
+
+    const std::uintptr_t control = pair[0];
+    const std::uintptr_t object = pair[1];
+    bool retained = false;
+    if (control) retained = model::retainManaged(control);
+    if (!object) {
+        if (retained) model::releaseManaged(control);
+        return env->NewStringUTF("");
+    }
+
+    const std::string name = nxtString(object + off::LOC_TYPE_NAME);
+    if (retained) model::releaseManaged(control);
+    return gameBytesToJString(env, name);
+}
+
+/// Hull/outline for a live scene Loc (tree, rock, wall, floor decoration, ...).
+/// Arguments are the Loc id and SCENE tile/plane. The native resolves the client-owned scene record,
+/// classifies its Renderable (RuntimeModel / ModelData / DynamicLoc), snapshots current geometry, and
+/// returns {x0,y0,x1,y1,...}. Empty means the object is absent or this build did not validate the path.
+///
+/// Registration is optional below: an older jar that has no Natives.objectHull declaration still loads.
+inline jintArray JNICALL nObjectHull(JNIEnv* env, jclass, jint id, jint sceneX, jint sceneY, jint plane) {
+    struct ModelReportAtExit { ~ModelReportAtExit() { model::maybeReport(); } } report;
+    if (!layout::locModelHighlights()) return env->NewIntArray(0);
+
+    SceneLoc loc;
+    if (!findSceneLoc(id, sceneX, sceneY, plane, loc)) return env->NewIntArray(0);
+
+    const int gameCycle = cycle();
+    std::vector<model::ScreenPoint> outline;
+    const bool projected = model::projectSceneLoc(
+        loc, gameCycle,
+        [](float x, float h, float y, model::ScreenPoint& out) {
+            float sx = 0.0f, sy = 0.0f;
+            if (!projectFine(static_cast<int>(std::lround(x)),
+                             static_cast<int>(std::lround(h)),
+                             static_cast<int>(std::lround(y)), sx, sy))
+                return false;
+            out = { sx, sy };
+            return true;
+        }, outline);
+    if (!projected) return env->NewIntArray(0);
+
+    std::vector<jint> flat;
+    flat.reserve(outline.size() * 2);
+    for (const auto& p : outline) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+        flat.push_back(static_cast<jint>(std::lround(p.x)));
+        flat.push_back(static_cast<jint>(std::lround(p.y)));
+    }
+    if (flat.size() < 6) return env->NewIntArray(0);
+    jintArray result = env->NewIntArray(static_cast<jsize>(flat.size()));
+    if (result) env->SetIntArrayRegion(result, 0, static_cast<jsize>(flat.size()), flat.data());
+    return result;
+}
+
 /// Resolver diagnostics as a flat int array: {fieldCount, per field: state, ...} plus model
 /// geometry counters. The launcher reads this through PanelBridge.debugLines().
 inline jintArray JNICALL nResolverDiagnostics(JNIEnv* env, jclass) {
-    // 13 fields * 2 (state + source-length encoded) + 6 model counters + header = 33 ints max
+    // Keep the legacy 13-state wire shape: Java may parse the counters by fixed index.
+    // LocScene/LocRenderableDispatch are available in native diagnostics::lines(), but are not
+    // appended here until the Java parser is updated in lockstep.
     jint v[48];
     int n = 0;
     namespace lay = layout;
@@ -1482,6 +1584,30 @@ inline bool startJvm(const std::wstring& javaHome, const std::wstring& jarPath, 
         { const_cast<char*>("inputTarget"), const_cast<char*>("(Z)[I"),   reinterpret_cast<void*>(nInputTarget) },
     };
     if (env->RegisterNatives(g_nat, natives, sizeof(natives) / sizeof(natives[0])) != JNI_OK) { err = "RegisterNatives failed"; return false; }
+
+    // Loc/object natives landed after the original Java API. Register each independently so a newer
+    // DLL remains compatible with an older jar, while a newer jar can opt into enumeration and/or hulls.
+    auto registerOptionalNative = [&](const char* name, const char* sig, void* fn) -> bool {
+        jmethodID decl = env->GetStaticMethodID(g_nat, name, sig);
+        if (!decl) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            kk::logf("[jvm] optional Natives.%s absent; native left disabled for this jar\n", name);
+            return true;
+        }
+        JNINativeMethod method = {
+            const_cast<char*>(name), const_cast<char*>(sig), fn
+        };
+        if (env->RegisterNatives(g_nat, &method, 1) != JNI_OK) {
+            err = std::string("RegisterNatives(") + name + ") failed";
+            return false;
+        }
+        kk::logf("[jvm] optional Natives.%s registered\n", name);
+        return true;
+    };
+
+    if (!registerOptionalNative("objects", "()[I", reinterpret_cast<void*>(nObjects))) return false;
+    if (!registerOptionalNative("objectHull", "(IIII)[I", reinterpret_cast<void*>(nObjectHull))) return false;
+    if (!registerOptionalNative("objectName", "(I)Ljava/lang/String;", reinterpret_cast<void*>(nObjectName))) return false;
 
     jclass local = env->FindClass("kewl/KewlKlient");
     if (!local) { err = "kewl/KewlKlient not found"; return false; }

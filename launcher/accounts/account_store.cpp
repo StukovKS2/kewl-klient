@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <objbase.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -158,4 +159,23 @@ void AccountStore::UpsertIdentity(JagexIdentity value) { if (auto* old = FindIde
 void AccountStore::UpsertCharacter(JagexCharacter value) { if (auto* old = FindCharacterByAccountId(value.accountId)) { value.id = old->id; if (value.label.empty()) value.label = old->label; value.createdAt = old->createdAt; *old = std::move(value); } else data_.jagexCharacters.push_back(std::move(value)); }
 void AccountStore::UpsertLegacy(LegacyAccount value) { if (auto* old = FindLegacy(value.id)) *old = std::move(value); else data_.legacyAccounts.push_back(std::move(value)); }
 bool AccountStore::RemoveCharacter(const std::string& id, std::string&) { for (auto it = data_.jagexCharacters.begin(); it != data_.jagexCharacters.end(); ++it) if (it->id == id) { data_.jagexCharacters.erase(it); return true; } return false; }
-bool AccountStore::RemoveIdentity(const std::string& id, std::string& error) { for (auto it = data_.jagexIdentities.begin(); it != data_.jagexIdentities.end(); ++it) if (it->id == id) { data_.jagexIdentities.erase(it); return true; } error = "identity not found"; return false; }
+bool AccountStore::RemoveIdentity(const std::string& id, std::string& error) {
+    auto identity = std::find_if(data_.jagexIdentities.begin(), data_.jagexIdentities.end(),
+                                 [&](const JagexIdentity& value) { return value.id == id; });
+    if (identity == data_.jagexIdentities.end()) {
+        error = "identity not found";
+        return false;
+    }
+
+    if (!identity->credentialReference.empty() &&
+        !credentials_.DeleteSecret(identity->credentialReference, error)) {
+        return false;
+    }
+
+    data_.jagexCharacters.erase(
+        std::remove_if(data_.jagexCharacters.begin(), data_.jagexCharacters.end(),
+                       [&](const JagexCharacter& character) { return character.identityId == id; }),
+        data_.jagexCharacters.end());
+    data_.jagexIdentities.erase(identity);
+    return true;
+}

@@ -8,7 +8,7 @@
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
-struct JagexAuthWindow::Impl {
+struct JagexAuthWindow::Impl : std::enable_shared_from_this<JagexAuthWindow::Impl> {
     HWND hwnd = nullptr;
     ComPtr<ICoreWebView2Environment> environment;
     ComPtr<ICoreWebView2Controller> controller;
@@ -28,7 +28,11 @@ struct JagexAuthWindow::Impl {
         if (!self) return DefWindowProcW(h, message, w, l);
         if (message == WM_SIZE && self->controller) { RECT r{}; GetClientRect(h, &r); self->controller->put_Bounds(r); return 0; }
         if (message == WM_CLOSE) { if (self->closed) self->closed(); DestroyWindow(h); return 0; }
-        if (message == WM_DESTROY) { self->hwnd = nullptr; return 0; }
+        if (message == WM_DESTROY) {
+            self->hwnd = nullptr;
+            if (self->owner) self->owner->hwnd_ = nullptr;
+            return 0;
+        }
         return DefWindowProcW(h, message, w, l);
     }
 
@@ -45,45 +49,64 @@ struct JagexAuthWindow::Impl {
         if (!hwnd) { error = "cannot create Jagex authentication window"; return false; }
         return true;
     }
-    void initializeWebView() {
+    bool initializeWebView(std::string& error) {
+        const std::weak_ptr<Impl> weak = shared_from_this();
         auto envHandler = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [this](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+            [weak](HRESULT result, ICoreWebView2Environment* env) -> HRESULT {
+                auto self = weak.lock();
+                if (!self) return S_OK;
                 if (FAILED(result) || !env) return result;
-                environment = env;
-                environment->CreateCoreWebView2Controller(hwnd,
+                self->environment = env;
+                self->environment->CreateCoreWebView2Controller(self->hwnd,
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [this](HRESULT hr, ICoreWebView2Controller* controller) -> HRESULT {
+                        [weak](HRESULT hr, ICoreWebView2Controller* controller) -> HRESULT {
+                            auto self = weak.lock();
+                            if (!self) return S_OK;
                             if (FAILED(hr) || !controller) return hr;
-                            this->controller = controller;
-                            controller->get_CoreWebView2(&webview);
-                            RECT r{}; GetClientRect(hwnd, &r); controller->put_Bounds(r);
-                            webview->add_NavigationStarting(
+                            self->controller = controller;
+                            controller->get_CoreWebView2(&self->webview);
+                            RECT r{}; GetClientRect(self->hwnd, &r); controller->put_Bounds(r);
+                            self->webview->add_NavigationStarting(
                                 Callback<ICoreWebView2NavigationStartingEventHandler>(
-                                    [this](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                    [weak](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                        auto self = weak.lock();
+                                        if (!self) return S_OK;
                                         LPWSTR uri = nullptr;
                                         if (SUCCEEDED(args->get_Uri(&uri)) && uri) {
                                             std::wstring value(uri); CoTaskMemFree(uri);
-                                            if (redirect && redirect(value)) args->put_Cancel(TRUE);
+                                            if (self->redirect && self->redirect(value)) args->put_Cancel(TRUE);
                                         }
                                         return S_OK;
                                     }).Get(), nullptr);
-                            if (!pendingUrl.empty()) { webview->Navigate(std::wstring(pendingUrl.begin(), pendingUrl.end()).c_str()); pendingUrl.clear(); }
+                            if (!self->pendingUrl.empty()) {
+                                self->webview->Navigate(std::wstring(self->pendingUrl.begin(), self->pendingUrl.end()).c_str());
+                                self->pendingUrl.clear();
+                            }
                             return S_OK;
                         }).Get());
                 return S_OK;
             });
-        HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, profile.c_str(), nullptr, envHandler.Get());
-        (void)hr;
+        const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, profile.c_str(), nullptr, envHandler.Get());
+        if (FAILED(hr)) {
+            error = "WebView2 environment creation failed (HRESULT " + std::to_string(static_cast<unsigned long>(hr)) + ")";
+            return false;
+        }
+        return true;
     }
 };
 
-JagexAuthWindow::JagexAuthWindow() : impl_(std::make_unique<Impl>()) { impl_->owner = this; }
+JagexAuthWindow::JagexAuthWindow() : impl_(std::make_shared<Impl>()) { impl_->owner = this; }
 JagexAuthWindow::~JagexAuthWindow() { Close(); }
 bool JagexAuthWindow::Open(const std::wstring& profile, RedirectCallback callback, ClosedCallback closed, std::string& error) {
     if (IsOpen()) { error = "Jagex authentication is already open"; return false; }
     impl_->profile = profile; impl_->redirect = std::move(callback); impl_->closed = std::move(closed);
     if (!impl_->createWindow(error)) return false;
-    hwnd_ = impl_->hwnd; impl_->initializeWebView(); return true;
+    hwnd_ = impl_->hwnd;
+    if (!impl_->initializeWebView(error)) {
+        Close();
+        return false;
+    }
+    return true;
 }
 bool JagexAuthWindow::Navigate(const std::string& url, std::string& error) {
     if (!IsOpen()) { error = "Jagex authentication window is not open"; return false; }

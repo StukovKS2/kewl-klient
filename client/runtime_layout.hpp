@@ -29,6 +29,8 @@ enum class Field : std::uint8_t {
     RuntimeModelGeometry,
     NpcCurrentModel,
     PlayerCurrentModel,
+    LocScene,
+    LocRenderableDispatch,
     Count,
 };
 
@@ -85,6 +87,11 @@ inline bool npcModelHighlights() {
 
 inline bool playerModelHighlights() {
     return entities() && projection() && runtimeModelGeometry() && available(Field::PlayerCurrentModel);
+}
+
+inline bool locModelHighlights() {
+    return available(Field::ClientObject) && projection() && runtimeModelGeometry() &&
+           available(Field::LocScene) && available(Field::LocRenderableDispatch);
 }
 
 inline bool gameState() {

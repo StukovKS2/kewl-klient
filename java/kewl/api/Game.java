@@ -26,6 +26,7 @@ public final class Game {
     private static List<Entity> entities = Collections.emptyList();
     private static List<Entity> npcs = Collections.emptyList();
     private static List<Entity> players = Collections.emptyList();
+    private static List<TileObject> tileObjects = Collections.emptyList();
     private static Local local = Local.ABSENT;
     private static int baseX, baseY;
     private static boolean loaded;
@@ -79,7 +80,17 @@ public final class Game {
         entities = Collections.unmodifiableList(all);
         npcs = Collections.unmodifiableList(n);
         players = Collections.unmodifiableList(p);
+        tileObjects = NativeObjects.readObjects();
     }
+
+    /** Every currently loaded scene object, deduplicated by the native scene record. */
+    public static List<TileObject> tileObjects() { return tileObjects; }
+
+    /** Naming variant for SDK/plugin callers. */
+    public static List<TileObject> getTileObjects() { return tileObjects(); }
+
+    /** Start a query over this frame's loaded objects. */
+    public static TileObjectQuery getObjects() { return new TileObjectQuery(tileObjects); }
 
     /** True once you are actually in the world -- not at the login screen, not still loading. */
     public static boolean ready() { return Natives.ready() && loaded && local.exists(); }

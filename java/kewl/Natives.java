@@ -33,6 +33,23 @@ public final class Natives {
     public static native int[] entities();
 
     /**
+     * Every loaded scene object, five ints per record: {id, sceneX, sceneY, plane, category}.
+     * Multi-tile GameObjects are deduplicated by the native scene-record address. Empty is a normal
+     * answer when the scene/layout is unavailable; this method is optional for older DLLs.
+     */
+    public static native int[] objects();
+
+    /** Optional object-definition display name, or an empty string when unavailable. */
+    public static native String objectName(int id);
+
+    /**
+     * Current visible model hull for a scene object as flattened screen coordinates
+     * {x0, y0, x1, y1, ...}. Empty means absent, unsupported, unavailable, or projection failure.
+     * The native registration is optional so older DLLs remain usable.
+     */
+    public static native int[] objectHull(int id, int sceneX, int sceneY, int plane);
+
+    /**
      * Current animated NPC model hull as flattened screen coordinates
      * {@code {x0, y0, x1, y1, ...}}. Empty when model acquisition or
      * validation is unavailable; player requests intentionally remain empty

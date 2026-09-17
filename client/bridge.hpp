@@ -156,7 +156,7 @@ constexpr int MAX_OPTIONS = 8;
 // guard the plugin/setting caps already are.
 constexpr int MAX_PROFILES = 32;
 constexpr int MAX_HUB      = 64;
-constexpr int MAX_DEBUG_LINES = 192;
+constexpr int MAX_DEBUG_LINES = 512;
 constexpr std::size_t DEBUG_LINE = 256;
 
 // The edit kinds, in the order the table in the layout comment above lists them. Values are part of
@@ -246,7 +246,7 @@ static_assert(MODEL_OFFSET % 8 == 0, "bridge contract: the model region is 8-ali
 // The reader's sanity caps, pinned so a future edit cannot quietly widen one past what Reader::count
 // (and the launcher's matching guard) is willing to believe.
 static_assert(MAX_PLUGINS <= 64 && MAX_SETTINGS_PER_PLUGIN <= 256 && MAX_PROFILES <= 64 &&
-              MAX_HUB <= 64 && MAX_DEBUG_LINES <= 256,
+              MAX_HUB <= 64 && MAX_DEBUG_LINES <= 512,
               "bridge contract: caps must stay within the reader's sanity bounds");
 
 // ------------------------------------------------------------------------------------------------
@@ -501,6 +501,14 @@ inline bool  g_rejected       = false;
 // can produce the model again.
 inline std::uint64_t g_nextSnapshotRetryMs = 0;
 
+// Native diagnostics contain live scene/object/entity data, not just static offsets. Java's plugin
+// model revision only changes when the panel model changes, so without a separate cadence those live
+// lines would freeze indefinitely while the player stood still. Republish the same Java model at a
+// low rate solely to refresh the diagnostics tail. 500 ms is fast enough to inspect a moving scene
+// without turning the full snapshot JNI call into frame work.
+inline constexpr std::uint64_t DIAGNOSTICS_REFRESH_MS = 500;
+inline std::uint64_t g_nextDiagnosticsRefreshMs = 0;
+
 struct Server {
     HANDLE  mapping = nullptr;
     HANDLE  mutex   = nullptr;
@@ -751,19 +759,22 @@ inline void tick() {
     if (kk::bridgeAvailable()) {
         std::int64_t rev = kk::bridgeModelRevision();
         std::uint64_t now = GetTickCount64();
-        if (rev >= 0 && rev != g_publishedRevision && now >= g_nextSnapshotRetryMs) {
+        const bool modelChanged = rev >= 0 && rev != g_publishedRevision;
+        const bool diagnosticsDue =
+            rev >= 0 && rev == g_publishedRevision && now >= g_nextDiagnosticsRefreshMs;
+
+        if ((modelChanged || diagnosticsDue) && now >= g_nextSnapshotRetryMs) {
             // The revision is only consumed on SUCCESS: a rejected snapshot leaves g_publishedRevision
             // pointing at the last good model, so the comparison above stays true and this retries at
             // the rate limit until Java can produce the model it already announced.
             //
-            // The rate limit belongs to the FAILURE path alone. Arming it before the attempt (as this
-            // did) also throttled the good case: a publish that succeeded blocked the next one for a
-            // second, so a toggle or a status line landing just after a publish waited up to 1 s to
-            // reach the strip -- most visible on reset rows, which have no optimistic echo to cover
-            // the gap (review 2026-09-06).
+            // When only diagnostics are due we intentionally rebuild the SAME revision. The launcher
+            // also re-reads the region on this cadence; modelRevision remains Java's semantic revision
+            // rather than being abused as a live-data sequence number.
             if (publishModel(rev)) {
                 g_publishedRevision = rev;
                 g_nextSnapshotRetryMs = 0;
+                g_nextDiagnosticsRefreshMs = now + DIAGNOSTICS_REFRESH_MS;
                 if (g_rejected) {
                     g_rejected = false;
                     kk::logf("[bridge] snapshot recovered\n");

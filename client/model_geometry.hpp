@@ -1,9 +1,10 @@
-// model_geometry.hpp -- read-only RuntimeModel geometry for future model hulls.
+// model_geometry.hpp -- read-only live model geometry for entity and scene-Loc hulls.
 //
-// This layer owns the unsafe boundary: it validates the concrete vtable, bounds the
-// vertex count, and copies all three mutable arrays before any projection work. It
-// calls the validated NPC actor model bridge only through the actor's virtual
-// slot 0. Its managed pair is released immediately after snapshotting.
+// This layer owns the unsafe boundary: it classifies RuntimeModel / ModelData / DynamicLoc,
+// bounds the common vertex layout, and copies all three mutable arrays before projection. NPCs
+// still use their validated actor-model bridge; scene Locs use the scene-owned Renderable and only
+// call DynamicLoc::getCurrentModel when the renderable is actually dynamic. Any managed pair we
+// acquire ourselves is released immediately after snapshotting.
 #pragma once
 
 #include <windows.h>
@@ -17,10 +18,13 @@
 #include "offsets.hpp"
 #include "runtime_layout.hpp"
 #include "log.hpp"
+#include "game.hpp"
 
 namespace kk::model {
 
 enum class EntityKind { Npc, Player };
+enum class GeometryObjectKind { RuntimeModel, ModelData };
+enum class RenderableKind { RuntimeModel, ModelData, DynamicLoc, Unknown };
 
 struct CurrentModelRef {
     std::uintptr_t model = 0;   // second member of a managed pair, when acquired safely
@@ -32,6 +36,9 @@ struct ScreenPoint { float x = 0.0f, y = 0.0f; };
 struct EntityPose {
     float fineX = 0.0f, fineY = 0.0f, fineH = 0.0f;
     int orientation = 0;
+};
+struct LocPose {
+    float fineX = 0.0f, fineY = 0.0f, fineH = 0.0f;
 };
 struct WorldPoint { float x = 0.0f, h = 0.0f, y = 0.0f; };
 
@@ -101,7 +108,7 @@ inline void maybeReport() {
     const ULONGLONG now = GetTickCount64();
     if (now - diagnostics.lastReport < 2000) return;
     diagnostics.lastReport = now;
-    kk::logf("[model] attempts=%llu acquired=%llu success=%llu capability=%llu actorRead=%llu entryMismatch=%llu resource=%llu client=%llu cycle=%llu pairEmpty=%llu snapshot=%llu projection=%llu vtableRva=%llx npcEntryRva=%llx resourceOff=%llx\n",
+    kk::logf("[model] attempts=%llu acquired=%llu success=%llu capability=%llu actorRead=%llu entryMismatch=%llu resource=%llu client=%llu cycle=%llu pairEmpty=%llu snapshot=%llu projection=%llu runtimeVt=%llx modelDataVt=%llx dynamicLocVt=%llx npcEntryRva=%llx resourceOff=%llx\n",
         static_cast<unsigned long long>(diagnostics.attempts.load()),
         static_cast<unsigned long long>(diagnostics.acquired.load()),
         static_cast<unsigned long long>(diagnostics.success.load()),
@@ -115,6 +122,8 @@ inline void maybeReport() {
         static_cast<unsigned long long>(diagnostics.snapshotFailed.load()),
         static_cast<unsigned long long>(diagnostics.projectionFailed.load()),
         static_cast<unsigned long long>(off::RUNTIME_MODEL_VTABLE),
+        static_cast<unsigned long long>(off::MODEL_DATA_VTABLE),
+        static_cast<unsigned long long>(off::DYNAMIC_LOC_VTABLE),
         static_cast<unsigned long long>(off::NPC_GET_MODEL_ENTRY),
         static_cast<unsigned long long>(off::NPC_MODEL_RESOURCE));
 }
@@ -150,8 +159,14 @@ inline bool snapshot(std::uintptr_t moduleBase, std::uintptr_t model,
     if (!model) return fail(Failure::NullModel);
 
     std::uintptr_t vtable = 0;
-    if (!read(model, vtable) || vtable != moduleBase + off::RUNTIME_MODEL_VTABLE)
-        return fail(Failure::WrongVtable);
+    if (!read(model, vtable)) return fail(Failure::WrongVtable);
+    const bool runtimeModel = off::RUNTIME_MODEL_VTABLE &&
+                              vtable == moduleBase + off::RUNTIME_MODEL_VTABLE;
+    const bool modelData = off::MODEL_DATA_VTABLE &&
+                           vtable == moduleBase + off::MODEL_DATA_VTABLE;
+    // ModelData and RuntimeModel share the hull-critical prefix on 240-7:
+    // count +0x28 and int32 X/Y/Z backing pointers at +0x40/+0x58/+0x70.
+    if (!runtimeModel && !modelData) return fail(Failure::WrongVtable);
     std::int32_t count = 0;
     if (!read(model + off::MODEL_VERTEX_COUNT, count) || count <= 0 || count > 262144)
         return fail(Failure::BadVertexCount);
@@ -169,6 +184,20 @@ inline bool snapshot(std::uintptr_t moduleBase, std::uintptr_t model,
     out.vertices.resize(static_cast<std::size_t>(count));
     for (std::int32_t i = 0; i < count; ++i)
         out.vertices[static_cast<std::size_t>(i)] = { x[i], y[i], z[i] };
+    return true;
+}
+
+// Retain one strong reference from a managed-pair control block. This mirrors the client's
+// _InterlockedIncrement(sub_140044D30(control + 8)) sequence used by LocType accessors before they
+// dereference the pair's object half.
+inline bool retainManaged(std::uintptr_t control) {
+    if (!control || !off::MANAGED_RELEASE_HELPER || !readable(control, 16)) return false;
+    using Helper = std::uintptr_t (__fastcall*)(std::uintptr_t);
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    auto helper = reinterpret_cast<Helper>(base + off::MANAGED_RELEASE_HELPER);
+    const std::uintptr_t counter = helper(control + off::MANAGED_STRONG_COUNT);
+    if (!counter || !readable(counter, sizeof(std::int32_t))) return false;
+    ::InterlockedIncrement(reinterpret_cast<volatile LONG*>(counter));
     return true;
 }
 
@@ -196,6 +225,56 @@ inline bool releaseManaged(std::uintptr_t control) {
     if (!readable(vt + off::MANAGED_DELETE_VTABLE, sizeof(std::uintptr_t))) return false;
     const std::uintptr_t deleteAddress = *reinterpret_cast<const std::uintptr_t*>(vt + off::MANAGED_DELETE_VTABLE);
     if (deleteAddress) reinterpret_cast<Destroy>(deleteAddress)(control);
+    return true;
+}
+
+inline RenderableKind classifyRenderable(std::uintptr_t moduleBase, std::uintptr_t renderable) {
+    if (!renderable) return RenderableKind::Unknown;
+    std::uintptr_t vtable = 0;
+    if (!read(renderable, vtable)) return RenderableKind::Unknown;
+    if (off::RUNTIME_MODEL_VTABLE && vtable == moduleBase + off::RUNTIME_MODEL_VTABLE)
+        return RenderableKind::RuntimeModel;
+    if (off::MODEL_DATA_VTABLE && vtable == moduleBase + off::MODEL_DATA_VTABLE)
+        return RenderableKind::ModelData;
+    if (off::DYNAMIC_LOC_VTABLE && vtable == moduleBase + off::DYNAMIC_LOC_VTABLE)
+        return RenderableKind::DynamicLoc;
+    return RenderableKind::Unknown;
+}
+
+/// Turn a scene-owned Renderable into a geometry-bearing object. Static RuntimeModel and ModelData
+/// are borrowed directly. DynamicLoc slot 0 returns a managed current-model pair, so only that path
+/// acquires ownership and therefore needs releaseManaged() after the snapshot.
+inline bool currentForRenderable(std::uintptr_t renderable, std::int32_t gameCycle,
+                                 CurrentModelRef& out, RenderableKind* kindOut = nullptr) {
+    out = {};
+    if (kindOut) *kindOut = RenderableKind::Unknown;
+    if (!renderable || !layout::available(layout::Field::LocRenderableDispatch)) return false;
+
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const RenderableKind kind = classifyRenderable(base, renderable);
+    if (kindOut) *kindOut = kind;
+    if (kind == RenderableKind::RuntimeModel || kind == RenderableKind::ModelData) {
+        out.model = renderable;
+        return true;
+    }
+    if (kind != RenderableKind::DynamicLoc || !off::DYNAMIC_LOC_GET_MODEL) return false;
+    if (!off::CYCLE || gameCycle < 0) return false;
+
+    using GetModel = void (__fastcall*)(std::uintptr_t, std::uintptr_t*, std::int32_t);
+    auto getModel = reinterpret_cast<GetModel>(base + off::DYNAMIC_LOC_GET_MODEL);
+    std::uintptr_t pair[2] = { 0, 0 };
+    getModel(renderable, pair, gameCycle);
+    if (!pair[1]) {
+        if (pair[0]) releaseManaged(pair[0]);
+        return false;
+    }
+    const RenderableKind produced = classifyRenderable(base, pair[1]);
+    if (produced != RenderableKind::RuntimeModel && produced != RenderableKind::ModelData) {
+        if (pair[0]) releaseManaged(pair[0]);
+        return false;
+    }
+    out.control = pair[0];
+    out.model = pair[1];
     return true;
 }
 
@@ -244,6 +323,14 @@ inline WorldPoint modelToWorld(const Vertex& v, const EntityPose& p) {
     return { p.fineX + x * c + z * s,
              p.fineH - static_cast<float>(v.y),
              p.fineY + z * c - x * s };
+}
+
+inline WorldPoint locModelToWorld(const Vertex& v, const LocPose& p) {
+    // LocType_GetModelData/GetModelDynamic already applies object orientation before the renderable is
+    // inserted into the scene. Scene records therefore contribute translation/height only here.
+    return { p.fineX + static_cast<float>(v.x),
+             p.fineH - static_cast<float>(v.y),
+             p.fineY + static_cast<float>(v.z) };
 }
 
 inline float cross(const ScreenPoint& o, const ScreenPoint& a, const ScreenPoint& b) {
@@ -325,5 +412,44 @@ inline bool projectSnapshot(const Snapshot& snapshot, const EntityPose& pose,
     return out.size() >= 3;
 }
 
+template <class Project>
+inline bool projectSceneLoc(const kk::SceneLoc& loc, std::int32_t gameCycle,
+                            Project&& project, std::vector<ScreenPoint>& out) {
+    out.clear();
+    if (!layout::locModelHighlights()) return false;
+    // Wall decorations carry additional scene-side x/y decoration offsets that are not yet
+    // mapped in this patch. Refuse them rather than drawing a confidently wrong shifted hull.
+    if (loc.category == kk::SceneLocCategory::WallDecoration) return false;
+
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const LocPose pose{ static_cast<float>(loc.fineX), static_cast<float>(loc.fineY),
+                        static_cast<float>(loc.fineH) };
+    const std::uintptr_t renderables[2] = { loc.renderableA, loc.renderableB };
+    bool anySnapshot = false;
+
+    for (int ri = 0; ri < 2; ++ri) {
+        const std::uintptr_t renderable = renderables[ri];
+        if (!renderable || (ri == 1 && renderable == renderables[0])) continue;
+
+        CurrentModelRef current;
+        if (!currentForRenderable(renderable, gameCycle, current)) continue;
+        Snapshot snap;
+        const bool copied = snapshot(base, current.model, snap);
+        if (current.control) releaseManaged(current.control);
+        if (!copied) continue;
+        anySnapshot = true;
+        out.reserve(out.size() + snap.vertices.size());
+        for (const auto& v : snap.vertices) {
+            const WorldPoint w = locModelToWorld(v, pose);
+            ScreenPoint sp;
+            if (project(w.x, w.h, w.y, sp) && std::isfinite(sp.x) && std::isfinite(sp.y))
+                out.push_back(sp);
+        }
+    }
+
+    if (!anySnapshot || out.size() < 3) { out.clear(); return false; }
+    out = radialSilhouette(out);
+    return out.size() >= 3;
+}
 
 } // namespace kk::model

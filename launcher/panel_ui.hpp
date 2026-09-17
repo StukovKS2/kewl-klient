@@ -1610,12 +1610,12 @@ inline void debugView(const Model& m) {
     }
     ImGui::Dummy(ImVec2(0, SP_2));
 
-    // Native diagnostics are deliberately a popout: the full offset table is large and should not
-    // consume the narrow 250px developer panel. The popup is opened on demand and has its own scroll.
-    if (pressButton("##open-native-diagnostics", "DLL diagnostics...", ImVec2(avail, ROW_H)))
+    // The developer inspector is a real top-level tool window, not an ImGui child of this strip.
+    // That makes it independently draggable/resizable and lets it float over the embedded game HWND.
+    if (pressButton("##open-native-diagnostics", "Game Explorer...", ImVec2(avail, ROW_H)))
         nativeDiagnosticsRequest() = true;
     if (tooltipsAllowed() && ImGui::IsItemHovered())
-        ImGui::SetTooltip("open the DLL's live runtime layout and every resolved offset");
+        ImGui::SetTooltip("open the draggable Game Explorer window (Runtime / Objects / Players / NPCs / Offsets)");
     ImGui::Dummy(ImVec2(0, SP_2));
 
     // ---- bridge state ----------------------------------------------------------------------------
@@ -1642,8 +1642,9 @@ inline void debugView(const Model& m) {
         ImGui::Text("hub: %d entries, state %d", (int)m.hub->size(), *m.hubState);
     ImGui::Dummy(ImVec2(0, SP_1));
     ImGui::PushStyleColor(ImGuiCol_Text, theme::f(theme::TEXT_3));
-    ImGui::TextWrapped("not in the bridge contract yet: the memory-read lines (ready, you, npcs, "
-                       "inventory, pathcheck).");
+    ImGui::TextWrapped("The inspector refreshes live scene diagnostics twice per second. Open it to "
+                       "see nearby object IDs/categories/renderable vtables, nearby players/NPCs, "
+                       "runtime capability states, and the complete offset table.");
     ImGui::PopStyleColor();
 }
 

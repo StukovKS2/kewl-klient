@@ -49,6 +49,12 @@ inline std::uintptr_t DO_ACTION       = 0;
 // displacements added to a validated RuntimeModel object. They are installed
 // only for an exact, structurally validated 240-7 image.
 inline std::uintptr_t RUNTIME_MODEL_VTABLE     = 0;
+inline std::uintptr_t MODEL_DATA_VTABLE        = 0;
+inline std::uintptr_t DYNAMIC_LOC_VTABLE       = 0;
+inline std::uintptr_t DYNAMIC_LOC_GET_MODEL    = 0;
+inline std::uintptr_t LOC_TAG_TO_ID            = 0;
+inline std::uintptr_t LOC_TYPE_GET              = 0; // RVA: LocType cache/loader by id
+inline std::uintptr_t LOC_TYPE_NAME             = 0; // object displacement: native NxtString
 inline std::uintptr_t RUNTIME_MODEL_CTOR       = 0;
 inline std::uintptr_t RUNTIME_MODEL_CLONE      = 0;
 inline std::uintptr_t RUNTIME_MODEL_APPLY_ANIM = 0;
@@ -121,6 +127,47 @@ inline std::uintptr_t SCENE_BASE_X        = 0x24;
 inline std::uintptr_t SCENE_BASE_Y        = 0x28;
 inline std::uintptr_t SCENE_NPC_UIDS      = 0xD0;
 inline std::uintptr_t SCENE_NPC_UID_COUNT = 0xD8;
+
+// Loc/object scene storage. These are deliberately zero by default and are
+// installed only for an exact structurally validated 240-7 image. The tile
+// grid is an array of 16-byte managed pairs; the second qword is SceneTile*.
+inline std::uintptr_t SCENE_TILE_DIM_X       = 0;
+inline std::uintptr_t SCENE_TILE_DIM_Y       = 0;
+inline std::uintptr_t SCENE_TILE_GRID        = 0;
+inline std::uintptr_t SCENE_TILE_ENTRY_STRIDE= 0;
+inline std::uintptr_t SCENE_TILE_OBJECT      = 0;
+
+inline std::uintptr_t TILE_GAME_OBJECT_COUNT = 0;
+inline std::uintptr_t TILE_GAME_OBJECTS      = 0;
+inline std::uintptr_t TILE_BOUNDARY_OBJECT   = 0;
+inline std::uintptr_t TILE_WALL_DECORATION   = 0;
+inline std::uintptr_t TILE_FLOOR_DECORATION  = 0;
+
+// Boundary/WallDecoration/FloorDecoration share this placement prefix.
+inline std::uintptr_t LOC_FIXED_FINE_X       = 0;
+inline std::uintptr_t LOC_FIXED_FINE_H       = 0;
+inline std::uintptr_t LOC_FIXED_FINE_Y       = 0;
+inline std::uintptr_t LOC_FIXED_TAG          = 0;
+inline std::uintptr_t BOUNDARY_RENDERABLE_A  = 0;
+inline std::uintptr_t BOUNDARY_RENDERABLE_B  = 0;
+inline std::uintptr_t WALL_RENDERABLE_A      = 0;
+inline std::uintptr_t WALL_RENDERABLE_B      = 0;
+inline std::uintptr_t FLOOR_RENDERABLE       = 0;
+
+// GameObject payload. A multi-tile object is referenced by every covered
+// SceneTile, so callers deduplicate by the GameObject pointer when enumerating.
+inline std::uintptr_t GAME_OBJECT_FINE_H         = 0;
+inline std::uintptr_t GAME_OBJECT_FINE_X         = 0;
+inline std::uintptr_t GAME_OBJECT_FINE_Y         = 0;
+inline std::uintptr_t GAME_OBJECT_TAG            = 0;
+inline std::uintptr_t GAME_OBJECT_PLANE          = 0;
+inline std::uintptr_t GAME_OBJECT_START_X        = 0;
+inline std::uintptr_t GAME_OBJECT_END_X          = 0;
+inline std::uintptr_t GAME_OBJECT_START_Y        = 0;
+inline std::uintptr_t GAME_OBJECT_END_Y          = 0;
+inline std::uintptr_t GAME_OBJECT_RENDERABLE     = 0; // raw borrowed Renderable*
+inline std::uintptr_t GAME_OBJECT_RENDER_CONTROL = 0;
+inline std::uintptr_t GAME_OBJECT_RENDER_OBJECT  = 0;
 
 // ---------------------------------------------------------------------------
 // FIELDS ON AN ENTITY.

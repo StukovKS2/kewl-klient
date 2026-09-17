@@ -46,6 +46,7 @@ HWND        g_game = nullptr;
 HWND        g_host = nullptr;     // the one top-level window: game and panel are children of it.
                                   // In launcher mode this is the LAUNCHER's window, never created here.
 HWND        g_renderView = nullptr;   // NXT's GL child -- the window that must hold keyboard focus
+std::vector<DWORD> g_attachedInputTids;
 std::string g_javaError;      // shown natively if the VM never started
 bool        g_launcherMode = false;
 
@@ -501,13 +502,24 @@ LRESULT CALLBACK renderViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 //
 // Shared by both modes -- the launcher does not create our input for us, and a game sitting in the
 // launcher's window needs exactly the same queue-joining and cursor fix as one sitting in ours.
+void detachInput() {
+    const DWORD me = GetCurrentThreadId();
+    for (DWORD tid : g_attachedInputTids) {
+        if (tid) AttachThreadInput(me, tid, FALSE);
+    }
+    g_attachedInputTids.clear();
+}
+
 void attachInput() {
+    // Rebuild the joins when NXT recreates either window. AttachThreadInput is per-thread and the
+    // old game thread may otherwise remain joined forever after its window is gone.
+    detachInput();
     g_renderView = FindWindowExW(g_game, nullptr, L"JagRenderView", nullptr);
     DWORD tidTop = GetWindowThreadProcessId(g_game, nullptr);
     DWORD tidRv  = g_renderView ? GetWindowThreadProcessId(g_renderView, nullptr) : 0;
     DWORD myTid  = GetCurrentThreadId();
-    if (tidTop) AttachThreadInput(myTid, tidTop, TRUE);
-    if (tidRv && tidRv != tidTop) AttachThreadInput(myTid, tidRv, TRUE);
+    if (tidTop && AttachThreadInput(myTid, tidTop, TRUE)) g_attachedInputTids.push_back(tidTop);
+    if (tidRv && tidRv != tidTop && AttachThreadInput(myTid, tidRv, TRUE)) g_attachedInputTids.push_back(tidRv);
     giveGameFocus();
     // Button-press latch for nInput (jvm.hpp): the render view's thread is the one that receives
     // the clicks, so hook that one (falls back to the top-level's when there is no render view).
@@ -639,7 +651,16 @@ DWORD WINAPI run(LPVOID module) {
         // the host's minimize/restore/taskbar behaviour. Blunt style replacement on purpose -- any
         // POPUP/CAPTION/THICKFRAME bits left behind would draw a second frame inside ours.
         SetWindowLongPtrW(g_game, GWL_STYLE, WS_CHILD | WS_VISIBLE);
-        SetParent(g_game, g_host);
+        SetLastError(ERROR_SUCCESS);
+        if (!SetParent(g_game, g_host) && GetLastError() != ERROR_SUCCESS) {
+            kk::logf("[dll] failed to embed game window (error %lu)\n", GetLastError());
+            return 0;
+        }
+        if (!SetWindowPos(g_game, nullptr, 0, 0, 0, 0,
+                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
+            kk::logf("[dll] failed to refresh game frame after embedding (error %lu)\n", GetLastError());
+            return 0;
+        }
         layoutEmbed();
         attachInput();
     } else {
@@ -763,7 +784,13 @@ DWORD WINAPI run(LPVOID module) {
                 // host exactly the way the startup path put the first one there. In launcher mode the
                 // launcher does this on its own schedule and anything here would fight it.
                 SetWindowLongPtrW(g_game, GWL_STYLE, WS_CHILD | WS_VISIBLE);
-                SetParent(g_game, g_host);
+                SetLastError(ERROR_SUCCESS);
+                if (!SetParent(g_game, g_host) && GetLastError() != ERROR_SUCCESS) {
+                    kk::logf("[dll] failed to reparent recreated game window (error %lu)\n", GetLastError());
+                    continue;
+                }
+                SetWindowPos(g_game, nullptr, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
                 lastHostW = lastHostH = -1;            // force a fresh layout pass below
                 layoutEmbed();
             }
@@ -888,6 +915,7 @@ DWORD WINAPI run(LPVOID module) {
         Sleep(33);                                     // ~30 fps is plenty for an overlay
     }
 
+    detachInput();
     kk::g_overlay.release();
     if (kk::g_overlay.hwnd && IsWindow(kk::g_overlay.hwnd)) DestroyWindow(kk::g_overlay.hwnd);
     if (kk::panel::g_panel.hwnd) {

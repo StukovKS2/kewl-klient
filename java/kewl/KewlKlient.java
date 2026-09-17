@@ -54,6 +54,7 @@ public final class KewlKlient {
             new kewl.plugins.PlayerVisuals().markDeveloper(),
             new kewl.plugins.NpcVisuals().markDeveloper(),
             new kewl.plugins.Woodcutter(),
+            new kewl.plugins.objecthighlighter.ObjectHighlighterPlugin(),
             new kewl.rl.RlitePlugin("Shortest Path", "Pathfinder over the world map, with auto-walk",
                     shortestpath.ShortestPathPlugin::new),
             // RuneLite ports over the shim's actor surface (net.runelite.client.plugins.*). Opt-in

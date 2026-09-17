@@ -70,6 +70,228 @@ inline Tile sceneBase() {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// Scene Locs (trees, rocks, walls, floor decorations, etc.)
+// ---------------------------------------------------------------------------------------------------
+
+enum class SceneLocCategory : std::uint16_t {
+    BoundaryObject  = 0x100,
+    WallDecoration = 0x101,
+    GameObject      = 0x102,
+    FloorDecoration = 0x103,
+};
+
+struct SceneLoc {
+    int id = -1;
+    int sceneX = 0, sceneY = 0, plane = 0;
+    SceneLocCategory category = SceneLocCategory::GameObject;
+    std::uintptr_t addr = 0;
+    std::uintptr_t renderableA = 0;
+    std::uintptr_t renderableB = 0;
+    int fineX = 0, fineH = 0, fineY = 0;
+};
+
+inline bool saneSceneLocPose(const SceneLoc& loc) {
+    // Scene-fine coordinates are roughly 0..(104<<7). Leave margin for large footprints and
+    // decorations, but reject pointer fragments before they reach projection math.
+    return loc.fineX >= -512 && loc.fineX <= (128 << 7) &&
+           loc.fineY >= -512 && loc.fineY <= (128 << 7) &&
+           loc.fineH >= -8192 && loc.fineH <= 4096;
+}
+
+inline int locIdFromTag(std::uint64_t tag) {
+    if (!tag || !off::LOC_TAG_TO_ID || !layout::available(layout::Field::LocScene)) return -1;
+    using Fn = std::uint32_t (__fastcall*)(std::uint64_t);
+    auto fn = reinterpret_cast<Fn>(moduleBase() + off::LOC_TAG_TO_ID);
+    return static_cast<int>(fn(tag));
+}
+
+inline std::uintptr_t sceneTile(int plane, int sceneX, int sceneY) {
+    if (!layout::available(layout::Field::LocScene) || plane < 0 || plane > 3) return 0;
+    const std::uintptr_t s = scene();
+    if (!s || !off::SCENE_TILE_DIM_X || !off::SCENE_TILE_DIM_Y || !off::SCENE_TILE_GRID ||
+        !off::SCENE_TILE_ENTRY_STRIDE || !off::SCENE_TILE_OBJECT) return 0;
+
+    const int dimX = rd<std::int32_t>(s + off::SCENE_TILE_DIM_X);
+    const int dimY = rd<std::int32_t>(s + off::SCENE_TILE_DIM_Y);
+    if (dimX <= 0 || dimX > 128 || dimY <= 0 || dimY > 128 ||
+        sceneX < 0 || sceneY < 0 || sceneX >= dimX || sceneY >= dimY) return 0;
+
+    const std::uintptr_t grid = rdp(s + off::SCENE_TILE_GRID);
+    if (!grid) return 0;
+    const std::size_t index = static_cast<std::size_t>(sceneY) +
+        static_cast<std::size_t>(dimY) * (static_cast<std::size_t>(sceneX) +
+        static_cast<std::size_t>(dimX) * static_cast<std::size_t>(plane));
+    const std::uintptr_t entry = grid + index * off::SCENE_TILE_ENTRY_STRIDE;
+    return rdp(entry + off::SCENE_TILE_OBJECT);
+}
+
+inline bool fillFixedSceneLoc(std::uintptr_t record, SceneLocCategory category, int wantedId,
+                              int sceneX, int sceneY, int plane,
+                              std::uintptr_t renderableAOff, std::uintptr_t renderableBOff,
+                              SceneLoc& out) {
+    if (!record || !off::LOC_FIXED_TAG || !renderableAOff) return false;
+    const std::uint64_t tag = rd<std::uint64_t>(record + off::LOC_FIXED_TAG);
+    if (locIdFromTag(tag) != wantedId) return false;
+
+    out = {};
+    out.id = wantedId;
+    out.sceneX = sceneX; out.sceneY = sceneY; out.plane = plane;
+    out.category = category;
+    out.addr = record;
+    out.fineX = rd<std::int32_t>(record + off::LOC_FIXED_FINE_X);
+    out.fineH = rd<std::int32_t>(record + off::LOC_FIXED_FINE_H);
+    out.fineY = rd<std::int32_t>(record + off::LOC_FIXED_FINE_Y);
+    out.renderableA = rdp(record + renderableAOff);
+    out.renderableB = renderableBOff ? rdp(record + renderableBOff) : 0;
+    return saneSceneLocPose(out) && (out.renderableA || out.renderableB);
+}
+
+/// Resolve the live scene record for one Loc at a tile. This mirrors the native lookup order
+/// (wall decoration, boundary, floor decoration, game-object list) and returns the scene-owned
+/// Renderable object(s); it never rebuilds a LocType model. Multi-tile GameObjects appear in each
+/// covered tile, so an id/tile lookup naturally finds the same GameObject from any occupied tile.
+inline bool findSceneLoc(int id, int sceneX, int sceneY, int plane, SceneLoc& out) {
+    out = {};
+    if (id < 0 || !layout::available(layout::Field::LocScene)) return false;
+    const std::uintptr_t tile = sceneTile(plane, sceneX, sceneY);
+    if (!tile) return false;
+
+    if (fillFixedSceneLoc(rdp(tile + off::TILE_WALL_DECORATION),
+                          SceneLocCategory::WallDecoration, id, sceneX, sceneY, plane,
+                          off::WALL_RENDERABLE_A, off::WALL_RENDERABLE_B, out)) return true;
+    if (fillFixedSceneLoc(rdp(tile + off::TILE_BOUNDARY_OBJECT),
+                          SceneLocCategory::BoundaryObject, id, sceneX, sceneY, plane,
+                          off::BOUNDARY_RENDERABLE_A, off::BOUNDARY_RENDERABLE_B, out)) return true;
+    if (fillFixedSceneLoc(rdp(tile + off::TILE_FLOOR_DECORATION),
+                          SceneLocCategory::FloorDecoration, id, sceneX, sceneY, plane,
+                          off::FLOOR_RENDERABLE, 0, out)) return true;
+
+    int count = rd<std::int32_t>(tile + off::TILE_GAME_OBJECT_COUNT);
+    const std::uintptr_t entries = rdp(tile + off::TILE_GAME_OBJECTS);
+    if (count < 0 || count > 5 || !entries) return false;
+    for (int i = 0; i < count; ++i) {
+        const std::uintptr_t object = rdp(entries + static_cast<std::uintptr_t>(i) * 0x10 + 0x8);
+        if (!object) continue;
+        const std::uint64_t tag = rd<std::uint64_t>(object + off::GAME_OBJECT_TAG);
+        if (locIdFromTag(tag) != id) continue;
+
+        out = {};
+        out.id = id;
+        out.sceneX = sceneX; out.sceneY = sceneY; out.plane = plane;
+        out.category = SceneLocCategory::GameObject;
+        out.addr = object;
+        out.fineH = rd<std::int32_t>(object + off::GAME_OBJECT_FINE_H);
+        out.fineX = rd<std::int32_t>(object + off::GAME_OBJECT_FINE_X);
+        out.fineY = rd<std::int32_t>(object + off::GAME_OBJECT_FINE_Y);
+        out.renderableA = rdp(object + off::GAME_OBJECT_RENDER_OBJECT);
+        if (!out.renderableA) out.renderableA = rdp(object + off::GAME_OBJECT_RENDERABLE);
+        return saneSceneLocPose(out) && out.renderableA != 0;
+    }
+    return false;
+}
+
+
+/// Enumerate every live scene Loc once. Fixed-position records occur on exactly one SceneTile;
+/// GameObjects are referenced by every tile in their footprint, so those are deduplicated by the
+/// actual GameObject record pointer before they escape this function. Enumeration deliberately does
+/// not require a Renderable: an object whose model is temporarily absent is still a real scene object
+/// and Java can fall back to its tile highlight.
+template <class F>
+void forEachSceneLoc(F&& cb) {
+    if (!layout::available(layout::Field::LocScene)) return;
+    const std::uintptr_t s = scene();
+    if (!s || !off::SCENE_TILE_DIM_X || !off::SCENE_TILE_DIM_Y) return;
+
+    const int dimX = rd<std::int32_t>(s + off::SCENE_TILE_DIM_X);
+    const int dimY = rd<std::int32_t>(s + off::SCENE_TILE_DIM_Y);
+    if (dimX <= 0 || dimX > 128 || dimY <= 0 || dimY > 128) return;
+
+    std::vector<std::uintptr_t> seenGameObjects;
+    seenGameObjects.reserve(256);
+
+    auto emitFixed = [&](std::uintptr_t record, SceneLocCategory category,
+                         int sceneX, int sceneY, int plane,
+                         std::uintptr_t renderableAOff, std::uintptr_t renderableBOff) {
+        if (!record || !off::LOC_FIXED_TAG) return;
+        const std::uint64_t tag = rd<std::uint64_t>(record + off::LOC_FIXED_TAG);
+        const int id = locIdFromTag(tag);
+        if (id < 0) return;
+
+        SceneLoc loc{};
+        loc.id = id;
+        loc.sceneX = sceneX;
+        loc.sceneY = sceneY;
+        loc.plane = plane;
+        loc.category = category;
+        loc.addr = record;
+        loc.fineX = rd<std::int32_t>(record + off::LOC_FIXED_FINE_X);
+        loc.fineH = rd<std::int32_t>(record + off::LOC_FIXED_FINE_H);
+        loc.fineY = rd<std::int32_t>(record + off::LOC_FIXED_FINE_Y);
+        loc.renderableA = renderableAOff ? rdp(record + renderableAOff) : 0;
+        loc.renderableB = renderableBOff ? rdp(record + renderableBOff) : 0;
+        cb(loc);
+    };
+
+    for (int plane = 0; plane < 4; ++plane) {
+        for (int sceneX = 0; sceneX < dimX; ++sceneX) {
+            for (int sceneY = 0; sceneY < dimY; ++sceneY) {
+                const std::uintptr_t tile = sceneTile(plane, sceneX, sceneY);
+                if (!tile) continue;
+
+                emitFixed(rdp(tile + off::TILE_BOUNDARY_OBJECT),
+                          SceneLocCategory::BoundaryObject, sceneX, sceneY, plane,
+                          off::BOUNDARY_RENDERABLE_A, off::BOUNDARY_RENDERABLE_B);
+                emitFixed(rdp(tile + off::TILE_WALL_DECORATION),
+                          SceneLocCategory::WallDecoration, sceneX, sceneY, plane,
+                          off::WALL_RENDERABLE_A, off::WALL_RENDERABLE_B);
+                emitFixed(rdp(tile + off::TILE_FLOOR_DECORATION),
+                          SceneLocCategory::FloorDecoration, sceneX, sceneY, plane,
+                          off::FLOOR_RENDERABLE, 0);
+
+                const int count = rd<std::int32_t>(tile + off::TILE_GAME_OBJECT_COUNT);
+                const std::uintptr_t entries = rdp(tile + off::TILE_GAME_OBJECTS);
+                if (count <= 0 || count > 5 || !entries) continue;
+
+                for (int i = 0; i < count; ++i) {
+                    const std::uintptr_t object =
+                        rdp(entries + static_cast<std::uintptr_t>(i) * 0x10 + 0x8);
+                    if (!object) continue;
+                    if (std::find(seenGameObjects.begin(), seenGameObjects.end(), object) !=
+                        seenGameObjects.end()) continue;
+                    seenGameObjects.push_back(object);
+
+                    const std::uint64_t tag = rd<std::uint64_t>(object + off::GAME_OBJECT_TAG);
+                    const int id = locIdFromTag(tag);
+                    if (id < 0) continue;
+
+                    int originX = rd<std::int32_t>(object + off::GAME_OBJECT_START_X, sceneX);
+                    int originY = rd<std::int32_t>(object + off::GAME_OBJECT_START_Y, sceneY);
+                    int objectPlane = rd<std::int32_t>(object + off::GAME_OBJECT_PLANE, plane);
+                    if (originX < 0 || originX >= dimX) originX = sceneX;
+                    if (originY < 0 || originY >= dimY) originY = sceneY;
+                    if (objectPlane < 0 || objectPlane > 3) objectPlane = plane;
+
+                    SceneLoc loc{};
+                    loc.id = id;
+                    loc.sceneX = originX;
+                    loc.sceneY = originY;
+                    loc.plane = objectPlane;
+                    loc.category = SceneLocCategory::GameObject;
+                    loc.addr = object;
+                    loc.fineH = rd<std::int32_t>(object + off::GAME_OBJECT_FINE_H);
+                    loc.fineX = rd<std::int32_t>(object + off::GAME_OBJECT_FINE_X);
+                    loc.fineY = rd<std::int32_t>(object + off::GAME_OBJECT_FINE_Y);
+                    loc.renderableA = rdp(object + off::GAME_OBJECT_RENDER_OBJECT);
+                    if (!loc.renderableA)
+                        loc.renderableA = rdp(object + off::GAME_OBJECT_RENDERABLE);
+                    cb(loc);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Entities
 // ---------------------------------------------------------------------------------------------------
 struct Entity {

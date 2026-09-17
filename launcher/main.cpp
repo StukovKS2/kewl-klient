@@ -20,6 +20,7 @@
 // mode only happens when THIS program spawns the game and posts it the embed message.
 #include <windows.h>
 #include <windowsx.h>
+#include <dwmapi.h>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -35,6 +36,8 @@
 #include <sstream>
 #include <io.h>          // _open_osfhandle / _dup2: the KEWL_LOG redirect in WinMain
 #include <fcntl.h>
+
+#pragma comment(lib, "dwmapi.lib")
 
 #include "imgui.h"
 #include "imgui_sw.hpp"
@@ -289,7 +292,14 @@ struct Bridge {
         base = nullptr; hdr = nullptr; mtx = nullptr; map = nullptr; size = 0;
     }
 
-    bool lock(DWORD ms = 100)  { return mtx && WaitForSingleObject(mtx, ms) == WAIT_OBJECT_0; }
+    bool lock(DWORD ms = 100) {
+        if (!mtx) return false;
+        const DWORD result = WaitForSingleObject(mtx, ms);
+        // WAIT_ABANDONED grants ownership to this thread. Treat the model as potentially stale,
+        // but still release the mutex on every caller path so one crashed writer cannot wedge the
+        // bridge permanently.
+        return result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+    }
     void unlock()              { if (mtx) ReleaseMutex(mtx); }
 };
 Bridge g_bridge;
@@ -299,67 +309,356 @@ std::vector<kewl_panel::ProfileModel> g_profiles;
 std::vector<kewl_panel::HubEntry> g_hub;
 std::vector<std::string> g_debugLines;
 HWND g_diagnosticsWindow = nullptr;
-int g_diagnosticsScroll = 0;
 std::int32_t g_activeProfile = -1;
+
+// -------------------------------------------------------------------------------------------------
+// Floating Developer Inspector
+// -------------------------------------------------------------------------------------------------
+// This is deliberately a REAL top-level HWND, not another ImGui panel inside the launcher. The game
+// is embedded as a child HWND and child HWNDs composite above their parent, so an ImGui window drawn
+// by the launcher cannot float over the game area. A tool-window HWND can: it has its own caption,
+// can be dragged/resized independently of the right sidebar, and stays visible above the client.
+//
+// The content is still fed by the same g_debugLines bridge tail. We only turn those lines into a small
+// explorer UI here; the DLL remains the owner of all game-memory reads.
+enum InspectorTab : int {
+    INSPECT_RUNTIME = 0,
+    INSPECT_OBJECTS,
+    INSPECT_PLAYERS,
+    INSPECT_NPCS,
+    INSPECT_OFFSETS,
+    INSPECT_RAW,
+    INSPECT_TAB_COUNT
+};
+
+int g_inspectorTab = INSPECT_RUNTIME;
+int g_inspectorSelected[INSPECT_TAB_COUNT] = { -1, -1, -1, -1, -1, -1 };
+int g_inspectorScroll[INSPECT_TAB_COUNT] = {};
+
+constexpr int INSPECT_TAB_H = 34;
+constexpr int INSPECT_ROW_H = 22;
+constexpr int INSPECT_PAD = 8;
+
+bool inspectorStartsWith(const std::string& s, const char* prefix) {
+    const std::size_t n = std::strlen(prefix);
+    return s.size() >= n && s.compare(0, n, prefix) == 0;
+}
+
+std::vector<std::string> inspectorRows(int tab) {
+    std::vector<std::string> out;
+    out.reserve(g_debugLines.size());
+    for (const std::string& line : g_debugLines) {
+        bool take = false;
+        switch (tab) {
+            case INSPECT_RUNTIME:
+                take = inspectorStartsWith(line, "runtime:") || inspectorStartsWith(line, "live:");
+                break;
+            case INSPECT_OBJECTS:
+                take = inspectorStartsWith(line, "object:");
+                break;
+            case INSPECT_PLAYERS:
+                take = inspectorStartsWith(line, "player:");
+                break;
+            case INSPECT_NPCS:
+                take = inspectorStartsWith(line, "npc:");
+                break;
+            case INSPECT_OFFSETS:
+                take = inspectorStartsWith(line, "offset:") || inspectorStartsWith(line, "offsets:");
+                break;
+            case INSPECT_RAW:
+                take = true;
+                break;
+            default:
+                break;
+        }
+        if (take) out.push_back(line);
+    }
+    return out;
+}
+
+const char* inspectorTabName(int tab) {
+    switch (tab) {
+        case INSPECT_RUNTIME: return "Runtime";
+        case INSPECT_OBJECTS: return "Objects";
+        case INSPECT_PLAYERS: return "Players";
+        case INSPECT_NPCS:    return "NPCs";
+        case INSPECT_OFFSETS: return "Offsets";
+        default:              return "Raw";
+    }
+}
+
+std::string inspectorTrim(std::string s) {
+    const auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const auto last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+std::vector<std::pair<std::string, std::string>> inspectorProperties(const std::string& line) {
+    std::vector<std::pair<std::string, std::string>> out;
+    const auto colon = line.find(':');
+    const std::string kind = colon == std::string::npos ? std::string() : inspectorTrim(line.substr(0, colon));
+    std::string rest = colon == std::string::npos ? line : inspectorTrim(line.substr(colon + 1));
+    if (!kind.empty()) out.emplace_back("type", kind);
+
+    // Offset rows are NAME VALUE rather than key=value.
+    if (kind == "offset") {
+        std::istringstream in(rest);
+        std::string name, value;
+        in >> name >> value;
+        if (!name.empty()) out.emplace_back("name", name);
+        if (!value.empty()) out.emplace_back("value", value);
+        return out;
+    }
+
+    std::istringstream in(rest);
+    std::string token;
+    while (in >> token) {
+        const auto eq = token.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = token.substr(0, eq);
+        std::string value = token.substr(eq + 1);
+        if (!key.empty()) out.emplace_back(std::move(key), std::move(value));
+    }
+    return out;
+}
+
+void inspectorFill(HDC dc, const RECT& r, COLORREF c) {
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, &r, b);
+    DeleteObject(b);
+}
+
+void inspectorText(HDC dc, const RECT& r, COLORREF color, const std::wstring& text,
+                   UINT flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS) {
+    SetTextColor(dc, color);
+    RECT copy = r;
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &copy, flags);
+}
+
+int inspectorLeftWidth(const RECT& client) {
+    const int w = client.right - client.left;
+    return (std::max)(280, (std::min)(420, w * 42 / 100));
+}
+
+void inspectorClampScroll(const RECT& client, int tab, int rowCount) {
+    const int bodyH = (std::max)(0, static_cast<int>(client.bottom) - INSPECT_TAB_H - INSPECT_PAD * 2);
+    const int visible = (std::max)(1, bodyH / INSPECT_ROW_H);
+    const int maxScroll = (std::max)(0, rowCount - visible);
+    g_inspectorScroll[tab] = (std::max)(0, (std::min)(g_inspectorScroll[tab], maxScroll));
+}
 
 LRESULT CALLBACK diagnosticsProc(HWND h, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+        info->ptMinTrackSize.x = 720;
+        info->ptMinTrackSize.y = 460;
+        return 0;
+    }
+
+    case WM_SIZE:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+
     case WM_PAINT: {
         PAINTSTRUCT ps{};
-        HDC dc = BeginPaint(h, &ps);
+        HDC paintDc = BeginPaint(h, &ps);
         RECT client{};
         GetClientRect(h, &client);
-        FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+
+        // Paint into a back buffer and copy once. The inspector refreshes while its live model
+        // changes; drawing directly into the window exposes each intermediate fill as a flash.
+        HDC dc = CreateCompatibleDC(paintDc);
+        HBITMAP backBuffer = CreateCompatibleBitmap(
+            paintDc,
+            (std::max)(1, static_cast<int>(client.right)),
+            (std::max)(1, static_cast<int>(client.bottom)));
+        HGDIOBJ oldBitmap = SelectObject(dc, backBuffer);
+
+        // Keep the native inspector on the same palette as the launcher sidebar
+        // (panel_ui.hpp::theme). This is intentionally the same material hierarchy:
+        // rail/window, body, row, text ramp, and RuneLite orange selection.
+        const COLORREF bg      = RGB(18, 18, 22);    // theme::STRUCT
+        const COLORREF panel   = RGB(28, 28, 32);    // theme::CANVAS
+        const COLORREF panel2  = RGB(38, 38, 44);    // theme::ROW
+        const COLORREF border  = RGB(62, 62, 72);    // theme::LINE
+        const COLORREF text    = RGB(234, 234, 240); // theme::TEXT_1
+        const COLORREF muted   = RGB(118, 118, 130); // theme::TEXT_3
+        const COLORREF accent  = RGB(220, 138, 0);   // theme::ACCENT
+        const COLORREF select  = RGB(60, 60, 70);    // theme::ROW_PRESS
+
+        inspectorFill(dc, client, bg);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(225, 225, 235));
-        HFONT font = static_cast<HFONT>(GetStockObject(ANSI_FIXED_FONT));
-        HFONT old = static_cast<HFONT>(SelectObject(dc, font));
-        const int lineHeight = 16;
-        const int visible = (std::max)(1, static_cast<int>((client.bottom - client.top) / lineHeight));
-        const int maxScroll = (std::max)(0, static_cast<int>(g_debugLines.size()) - visible);
-        g_diagnosticsScroll = (std::min)(g_diagnosticsScroll, maxScroll);
-        for (int i = g_diagnosticsScroll; i < static_cast<int>(g_debugLines.size()); ++i) {
-            const int y = (i - g_diagnosticsScroll) * lineHeight;
-            if (y >= client.bottom) break;
-            const std::wstring text = wide(g_debugLines[static_cast<std::size_t>(i)]);
-            TextOutW(dc, 8, y + 1, text.c_str(), static_cast<int>(text.size()));
+        HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HFONT oldFont = static_cast<HFONT>(SelectObject(dc, font));
+
+        // Top tab strip. Counts make the window immediately useful without selecting each tab.
+        const int tabW = 96;
+        for (int tab = 0; tab < INSPECT_TAB_COUNT; ++tab) {
+            RECT tr{ INSPECT_PAD + tab * tabW, 4, INSPECT_PAD + (tab + 1) * tabW - 4, INSPECT_TAB_H - 4 };
+            inspectorFill(dc, tr, tab == g_inspectorTab ? panel2 : panel);
+            if (tab == g_inspectorTab) {
+                RECT underline{ tr.left, tr.bottom - 2, tr.right, tr.bottom };
+                inspectorFill(dc, underline, accent);
+            }
+            auto rows = inspectorRows(tab);
+            std::string label = inspectorTabName(tab);
+            if (tab == INSPECT_OBJECTS || tab == INSPECT_PLAYERS || tab == INSPECT_NPCS)
+                label += " " + std::to_string(rows.size());
+            inspectorText(dc, tr, tab == g_inspectorTab ? text : muted, wide(label), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        SelectObject(dc, old);
+        RECT tabRule{ 0, INSPECT_TAB_H - 1, client.right, INSPECT_TAB_H };
+        inspectorFill(dc, tabRule, border);
+
+        std::vector<std::string> rows = inspectorRows(g_inspectorTab);
+        inspectorClampScroll(client, g_inspectorTab, static_cast<int>(rows.size()));
+
+        const int leftW = inspectorLeftWidth(client);
+        RECT leftPane{ INSPECT_PAD, INSPECT_TAB_H + INSPECT_PAD, leftW, client.bottom - INSPECT_PAD };
+        RECT rightPane{ leftW + 1, INSPECT_TAB_H + INSPECT_PAD, client.right - INSPECT_PAD, client.bottom - INSPECT_PAD };
+        inspectorFill(dc, leftPane, panel);
+        inspectorFill(dc, rightPane, panel2);
+        RECT split{ leftW, INSPECT_TAB_H + INSPECT_PAD, leftW + 1, client.bottom - INSPECT_PAD };
+        inspectorFill(dc, split, border);
+
+        if (rows.empty()) {
+            RECT empty = leftPane;
+            empty.left += 12;
+            empty.top += 10;
+            inspectorText(dc, empty, muted, L"No data for this view yet.", DT_LEFT | DT_TOP | DT_SINGLELINE);
+        } else {
+            const int scroll = g_inspectorScroll[g_inspectorTab];
+            int y = leftPane.top;
+            for (int i = scroll; i < static_cast<int>(rows.size()); ++i) {
+                if (y + INSPECT_ROW_H > leftPane.bottom) break;
+                RECT rr{ leftPane.left, y, leftPane.right, y + INSPECT_ROW_H };
+                if (i == g_inspectorSelected[g_inspectorTab]) inspectorFill(dc, rr, select);
+                else if (((i - scroll) & 1) != 0) inspectorFill(dc, rr, RGB(28, 28, 32)); // theme::CANVAS
+                RECT tx = rr;
+                tx.left += 8;
+                tx.right -= 8;
+                inspectorText(dc, tx, i == g_inspectorSelected[g_inspectorTab] ? text : RGB(234, 234, 240), wide(rows[i])); // theme::TEXT_1
+                y += INSPECT_ROW_H;
+            }
+
+            // Slim visual scroll indicator; mouse wheel does the actual scrolling.
+            const int bodyH = leftPane.bottom - leftPane.top;
+            const int visible = (std::max)(1, bodyH / INSPECT_ROW_H);
+            if (static_cast<int>(rows.size()) > visible) {
+                const int maxScroll = static_cast<int>(rows.size()) - visible;
+                const int trackH = bodyH;
+                const int thumbH = (std::max)(24, trackH * visible / static_cast<int>(rows.size()));
+                const int travel = (std::max)(1, trackH - thumbH);
+                const int thumbY = leftPane.top + travel * g_inspectorScroll[g_inspectorTab] / (std::max)(1, maxScroll);
+                RECT thumb{ leftPane.right - 4, thumbY, leftPane.right - 1, thumbY + thumbH };
+                inspectorFill(dc, thumb, RGB(118, 118, 130)); // theme::TEXT_3
+            }
+        }
+
+        // Property/detail pane, similar to an explorer/property inspector. Click any row on the left.
+        RECT title{ rightPane.left + 14, rightPane.top + 10, rightPane.right - 14, rightPane.top + 34 };
+        inspectorText(dc, title, text, wide(std::string(inspectorTabName(g_inspectorTab)) + " details"));
+        RECT titleRule{ rightPane.left + 12, rightPane.top + 38, rightPane.right - 12, rightPane.top + 39 };
+        inspectorFill(dc, titleRule, border);
+
+        const int selected = g_inspectorSelected[g_inspectorTab];
+        if (selected >= 0 && selected < static_cast<int>(rows.size())) {
+            const std::string& raw = rows[selected];
+            auto props = inspectorProperties(raw);
+            int y = rightPane.top + 50;
+            for (const auto& [key, value] : props) {
+                if (y + 22 >= rightPane.bottom - 70) break;
+                RECT kr{ rightPane.left + 14, y, rightPane.left + 130, y + 20 };
+                RECT vr{ rightPane.left + 138, y, rightPane.right - 14, y + 20 };
+                inspectorText(dc, kr, muted, wide(key));
+                inspectorText(dc, vr, text, wide(value));
+                y += 22;
+            }
+
+            RECT rawLabel{ rightPane.left + 14, rightPane.bottom - 62, rightPane.right - 14, rightPane.bottom - 44 };
+            inspectorText(dc, rawLabel, muted, L"raw");
+            RECT rawText{ rightPane.left + 14, rightPane.bottom - 42, rightPane.right - 14, rightPane.bottom - 8 };
+            inspectorText(dc, rawText, RGB(164, 164, 176), wide(raw), DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS); // theme::TEXT_2
+        } else {
+            RECT hint{ rightPane.left + 14, rightPane.top + 52, rightPane.right - 14, rightPane.top + 90 };
+            inspectorText(dc, hint, muted, L"Select a row on the left to inspect its fields.", DT_LEFT | DT_TOP | DT_WORDBREAK);
+        }
+
+        SelectObject(dc, oldFont);
+        BitBlt(paintDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, oldBitmap);
+        DeleteObject(backBuffer);
+        DeleteDC(dc);
         EndPaint(h, &ps);
         return 0;
     }
+
     case WM_MOUSEWHEEL: {
-        g_diagnosticsScroll -= GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * 3;
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+        g_inspectorScroll[g_inspectorTab] -= delta * 3;
         RECT client{};
         GetClientRect(h, &client);
-        const int visible = (std::max)(1, static_cast<int>((client.bottom - client.top) / 16));
-        const int maxScroll = (std::max)(0, static_cast<int>(g_debugLines.size()) - visible);
-        g_diagnosticsScroll = (std::max)(0, (std::min)(g_diagnosticsScroll, maxScroll));
+        const auto rows = inspectorRows(g_inspectorTab);
+        inspectorClampScroll(client, g_inspectorTab, static_cast<int>(rows.size()));
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
-    case WM_VSCROLL: {
+
+    case WM_LBUTTONDOWN: {
         RECT client{};
         GetClientRect(h, &client);
-        const int visible = (std::max)(1, static_cast<int>((client.bottom - client.top) / 16));
-        const int maxScroll = (std::max)(0, static_cast<int>(g_debugLines.size()) - visible);
-        switch (LOWORD(wParam)) {
-            case SB_LINEUP: --g_diagnosticsScroll; break;
-            case SB_LINEDOWN: ++g_diagnosticsScroll; break;
-            case SB_PAGEUP: g_diagnosticsScroll -= visible; break;
-            case SB_PAGEDOWN: g_diagnosticsScroll += visible; break;
-            case SB_THUMBPOSITION:
-            case SB_THUMBTRACK: g_diagnosticsScroll = HIWORD(wParam); break;
-            case SB_TOP: g_diagnosticsScroll = 0; break;
-            case SB_BOTTOM: g_diagnosticsScroll = maxScroll; break;
+        const int x = GET_X_LPARAM(lParam);
+        const int y = GET_Y_LPARAM(lParam);
+
+        if (y >= 4 && y < INSPECT_TAB_H) {
+            const int tabW = 96;
+            const int tab = (x - INSPECT_PAD) / tabW;
+            if (x >= INSPECT_PAD && tab >= 0 && tab < INSPECT_TAB_COUNT) {
+                g_inspectorTab = tab;
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
         }
-        g_diagnosticsScroll = (std::max)(0, (std::min)(g_diagnosticsScroll, maxScroll));
-        InvalidateRect(h, nullptr, FALSE);
-        return 0;
+
+        const int leftW = inspectorLeftWidth(client);
+        if (x >= INSPECT_PAD && x < leftW && y >= INSPECT_TAB_H + INSPECT_PAD) {
+            auto rows = inspectorRows(g_inspectorTab);
+            const int visibleIndex = (y - (INSPECT_TAB_H + INSPECT_PAD)) / INSPECT_ROW_H;
+            const int index = g_inspectorScroll[g_inspectorTab] + visibleIndex;
+            if (index >= 0 && index < static_cast<int>(rows.size())) {
+                g_inspectorSelected[g_inspectorTab] = index;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        }
+        break;
     }
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            ShowWindow(h, SW_HIDE);
+            return 0;
+        }
+        if (wParam == VK_PRIOR || wParam == VK_NEXT || wParam == VK_UP || wParam == VK_DOWN) {
+            const int amount = (wParam == VK_PRIOR ? -10 : wParam == VK_NEXT ? 10 : wParam == VK_UP ? -1 : 1);
+            g_inspectorScroll[g_inspectorTab] += amount;
+            RECT client{};
+            GetClientRect(h, &client);
+            const auto rows = inspectorRows(g_inspectorTab);
+            inspectorClampScroll(client, g_inspectorTab, static_cast<int>(rows.size()));
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        break;
+
     case WM_CLOSE:
         ShowWindow(h, SW_HIDE);
         return 0;
+
     case WM_DESTROY:
         g_diagnosticsWindow = nullptr;
         return 0;
@@ -369,29 +668,59 @@ LRESULT CALLBACK diagnosticsProc(HWND h, UINT message, WPARAM wParam, LPARAM lPa
 
 void showDiagnosticsWindow() {
     if (!g_diagnosticsWindow) {
-        static const wchar_t className[] = L"KewlKlientDiagnostics";
+        static const wchar_t className[] = L"KewlKlientDeveloperInspector";
         static bool registered = false;
         if (!registered) {
             WNDCLASSEXW wc{ sizeof wc };
             wc.lpfnWndProc = diagnosticsProc;
             wc.hInstance = GetModuleHandleW(nullptr);
             wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(IDC_ARROW));
-            wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            wc.hbrBackground = nullptr;
             wc.lpszClassName = className;
+            wc.style = CS_HREDRAW | CS_VREDRAW;
             RegisterClassExW(&wc);
             registered = true;
         }
+
+        // A top-level tool window is intentional: it is not docked to the launcher and can be moved,
+        // resized, alt-tabbed away from, or parked on a second monitor independently of the sidebar.
         g_diagnosticsWindow = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, className, L"KewlKlient - DLL diagnostics",
-            WS_OVERLAPPEDWINDOW | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT, 720, 700,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            className,
+            L"Game Explorer",
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            CW_USEDEFAULT, CW_USEDEFAULT, 980, 680,
             nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+        if (g_diagnosticsWindow) {
+            // Keep the standard resize/minimize/close behavior, but make the native caption follow
+            // the sidebar palette instead of the system's bright titlebar.
+            const BOOL darkMode = TRUE;
+            const COLORREF caption = RGB(18, 18, 22);
+            const COLORREF captionText = RGB(234, 234, 240);
+            DwmSetWindowAttribute(g_diagnosticsWindow, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                  &darkMode, sizeof darkMode);
+            DwmSetWindowAttribute(g_diagnosticsWindow, DWMWA_CAPTION_COLOR,
+                                  &caption, sizeof caption);
+            DwmSetWindowAttribute(g_diagnosticsWindow, DWMWA_TEXT_COLOR,
+                                  &captionText, sizeof captionText);
+
+            // Seed near the main client once. Do NOT reposition on later opens: once the user drags the
+            // inspector somewhere, reopening it should respect that choice for the rest of the session.
+            RECT mainRect{};
+            if (g_main && GetWindowRect(g_main, &mainRect)) {
+                SetWindowPos(g_diagnosticsWindow, HWND_TOPMOST,
+                             mainRect.left + 70, mainRect.top + 70, 980, 680,
+                             SWP_NOACTIVATE);
+            }
+        }
     }
     if (!g_diagnosticsWindow) return;
-    g_diagnosticsScroll = 0;
-    ShowWindow(g_diagnosticsWindow, SW_SHOW);
-    SetWindowPos(g_diagnosticsWindow, HWND_TOPMOST, 80, 80, 720, 700,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_diagnosticsWindow, nullptr, TRUE);
+
+    ShowWindow(g_diagnosticsWindow, SW_SHOWNORMAL);
+    SetWindowPos(g_diagnosticsWindow, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_diagnosticsWindow, nullptr, FALSE);
 }
 
 void refreshDiagnosticsWindow() {
@@ -752,12 +1081,23 @@ bool g_reducedMotion = false;           // ditto for the reduced-motion preferen
 DWORD g_gamePid = 0;
 HWND  g_game = nullptr;                 // the game's window, a WS_CHILD of ours once embedded
 HANDLE g_gameProc = nullptr;            // to notice the game dying before it opens a window
+DWORD g_attachedGameTid = 0;             // input queue currently joined to the launcher's queue
 double g_phaseStart = 0;
 bool g_quitWhenGameGone = false;        // set by WM_CLOSE once the game has been asked to close
 
 // What layoutEmbed last told the game to be -- the guard that keeps the self-heal loop below from
 // re-detecting our own SetWindowPos as "the game changed itself".
 int g_setGameW = -1, g_setGameH = -1;
+
+void abandonGameProcess() {
+    if (g_gameProc) {
+        TerminateProcess(g_gameProc, 1);
+        WaitForSingleObject(g_gameProc, 1000);
+        CloseHandle(g_gameProc);
+        g_gameProc = nullptr;
+    }
+    g_gamePid = 0;
+}
 
 void loadPaths() {
     wchar_t exe[MAX_PATH]{};
@@ -859,7 +1199,12 @@ bool injectDll(DWORD pid, const std::wstring& dllPath, std::wstring& err) {
     // theirs.
     auto loadLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
-    if (!loadLib) { err = L"no LoadLibraryW in kernel32?"; CloseHandle(proc); return false; }
+    if (!loadLib) {
+        err = L"no LoadLibraryW in kernel32?";
+        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
 
     HANDLE th = CreateRemoteThread(proc, nullptr, 0, loadLib, remote, 0, nullptr);
     if (!th) {
@@ -868,12 +1213,28 @@ bool injectDll(DWORD pid, const std::wstring& dllPath, std::wstring& err) {
         CloseHandle(proc);
         return false;
     }
-    WaitForSingleObject(th, 10000);
+    const DWORD wait = WaitForSingleObject(th, 10000);
+    if (wait != WAIT_OBJECT_0) {
+        err = wait == WAIT_TIMEOUT
+            ? L"DLL injection timed out"
+            : L"waiting for the DLL injection thread failed";
+        // The remote thread may still be reading the DLL path. Do not free remote until the thread
+        // has definitely terminated.
+        CloseHandle(th);
+        CloseHandle(proc);
+        return false;
+    }
+
     // The thread exit code is the low 32 bits of the returned HMODULE. USER handles are 32-bit
-    // significant even on Win64, so zero really does mean LoadLibrary returned null, and non-zero
-    // really does mean it came up.
+    // significant even on Win64, so zero really does mean LoadLibrary returned null.
     DWORD loaded = 0;
-    GetExitCodeThread(th, &loaded);
+    if (!GetExitCodeThread(th, &loaded)) {
+        err = L"GetExitCodeThread failed";
+        CloseHandle(th);
+        VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
+        CloseHandle(proc);
+        return false;
+    }
     CloseHandle(th);
     VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
     CloseHandle(proc);
@@ -885,7 +1246,25 @@ bool injectDll(DWORD pid, const std::wstring& dllPath, std::wstring& err) {
 // One window again: the game becomes a child on the left, the panel strip is the rest. The style
 // and parent changes are the same blunt ones dllmain.cpp makes -- any POPUP/CAPTION/THICKFRAME bit
 // left behind would draw a second frame inside ours.
-void embedGame(HWND game) {
+void detachGameInput() {
+    if (g_attachedGameTid) {
+        AttachThreadInput(GetCurrentThreadId(), g_attachedGameTid, FALSE);
+        g_attachedGameTid = 0;
+    }
+}
+
+bool attachGameInput(HWND game) {
+    const DWORD tid = game ? GetWindowThreadProcessId(game, nullptr) : 0;
+    if (g_attachedGameTid && g_attachedGameTid != tid) detachGameInput();
+    if (!tid) return false;
+    if (g_attachedGameTid == tid) return true;
+    if (!AttachThreadInput(GetCurrentThreadId(), tid, TRUE)) return false;
+    g_attachedGameTid = tid;
+    return true;
+}
+
+bool embedGame(HWND game) {
+    if (!game || !IsWindow(game)) return false;
     SetPropW(game, kLauncherProp, (HANDLE)g_main);
     // Tell the DLL launcher mode is on BEFORE the reparent: the DLL is mid-startup (injection only
     // just returned) and must not build its own host window around the game while we are about to
@@ -894,7 +1273,14 @@ void embedGame(HWND game) {
     PostMessageW(game, g_msgEmbed, (WPARAM)g_main, 0);
 
     SetWindowLongPtrW(game, GWL_STYLE, WS_CHILD | WS_VISIBLE);
-    SetParent(game, g_main);
+    SetLastError(ERROR_SUCCESS);
+    if (!SetParent(game, g_main) && GetLastError() != ERROR_SUCCESS) {
+        return false;
+    }
+    if (!SetWindowPos(game, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)) {
+        return false;
+    }
     g_game = game;
     // Join our input queue with the game's, the way dllmain.cpp's attachInput does for the DLL's
     // thread. Keyboard goes to the FOREGROUND queue's focus window, and the game -- spawned with
@@ -903,13 +1289,13 @@ void embedGame(HWND game) {
     // foreground queue keeps its focus on JagRenderView, so every keystroke still lands in the game
     // (traced live 2026-09-05: the search field showed active, zero WM_CHAR ever arrived). With the
     // queues joined, focus is one shared value the keepKeyboard loop can actually hold.
-    DWORD gameTid = GetWindowThreadProcessId(game, nullptr);
-    if (gameTid && !AttachThreadInput(GetCurrentThreadId(), gameTid, TRUE))
+    if (!attachGameInput(game))
         std::printf("[input] AttachThreadInput(launcher,game) failed (GetLastError=%lu) -- "
                     "keyboard focus stays with the game's queue\n", GetLastError());
     layoutEmbed();
     ShowWindow(game, SW_SHOW);
     setPhase(Phase::Embedded, L"");
+    return true;
 }
 
 // Put the game at (0,0) sized to the client minus the panel strip. Mirrors dllmain.cpp's
@@ -1027,7 +1413,19 @@ void bridgeTick() {
     if (!g_bridge.lock()) return;                   // DLL mid-publish: next frame
     std::int64_t rev = g_bridge.hdr->modelRevision;
     bool fresh = (rev != g_modelRevision);
-    if (fresh) readModel(g_bridge.base + kewl_bridge::MODEL_OFFSET, g_bridge.base + g_bridge.size, rev);
+
+    // The plugin model revision is semantic Java state, while the diagnostics tail now contains live
+    // scene data that the DLL refreshes independently at 2 Hz. Re-read the model region on the same
+    // low cadence even when Java's revision is unchanged so nearby objects/players in the Developer
+    // Inspector actually move. This is only a bounds-checked parse of shared memory, not a JNI call.
+    static double lastDiagnosticsRead = 0.0;
+    const double now = nowSeconds();
+    const bool diagnosticsDue = now - lastDiagnosticsRead >= 0.50;
+    if (fresh || diagnosticsDue) {
+        if (readModel(g_bridge.base + kewl_bridge::MODEL_OFFSET,
+                      g_bridge.base + g_bridge.size, rev))
+            lastDiagnosticsRead = now;
+    }
     g_bridge.unlock();
 }
 
@@ -1554,6 +1952,7 @@ bool frame() {
         g_hubState = kewl_bridge::HUB_IDLE;
         g_hubError.clear();
         g_modelRevision = -1;
+        detachGameInput();
         g_game = nullptr;
         if (g_gameProc) { CloseHandle(g_gameProc); g_gameProc = nullptr; }
         g_gamePid = 0;
@@ -1583,6 +1982,7 @@ bool frame() {
                 // cache write from a previous kill can stall NXT for tens of seconds before it
                 // shows anything (traced live 2026-09-05: 10s gave up, the window landed at ~14s,
                 // and the user is left staring at a dead home screen while the game runs fine).
+                abandonGameProcess();
                 setPhase(Phase::Home, L"osclient.exe never opened a window (30s).");
             }
             break;
@@ -1590,12 +1990,15 @@ bool frame() {
         case Phase::Inject: {
             std::wstring err;
             if (!injectDll(g_gamePid, g_dllPath, err)) {
+                abandonGameProcess();
                 setPhase(Phase::Home, L"injection failed: " + err);
-                if (g_gameProc) { CloseHandle(g_gameProc); g_gameProc = nullptr; }
-                g_gamePid = 0;
                 break;
             }
-            embedGame(findGameWindow());
+            if (!embedGame(findGameWindow())) {
+                abandonGameProcess();
+                setPhase(Phase::Home, L"the game window failed to embed");
+                break;
+            }
             if (g_phase == Phase::Embedded) {
                 g_phaseStart = nowSeconds();     // bridge-open retry budget starts now
                 g_status = L"embedded. waiting for the DLL bridge...";
@@ -1731,6 +2134,9 @@ bool frame() {
 }
 
 void startLaunch(const std::wstring& environmentBlock) {
+    // Never overwrite a still-owned process handle. A previous launch may have timed out before its
+    // window appeared; terminate and reap that child before starting another one.
+    if (g_gameProc) abandonGameProcess();
     loadPaths();
     if (GetFileAttributesW(g_gamePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         g_status = L"cannot find the game at: " + g_gamePath;
@@ -1775,6 +2181,14 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         EndPaint(h, &ps);
         return 0;
     }
+    case WM_ACTIVATEAPP:
+        if (w) {
+            if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetForegroundWindow(h);
+        }
+        break;
     case WM_SIZE:
         g_clientW = LOWORD(l);
         g_clientH = HIWORD(l);
@@ -1793,6 +2207,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         DestroyWindow(h);
         return 0;
     case WM_DESTROY:
+        detachGameInput();
         if (g_gameProc) CloseHandle(g_gameProc);
         PostQuitMessage(0);
         return 0;

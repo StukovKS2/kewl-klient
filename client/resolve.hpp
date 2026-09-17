@@ -84,7 +84,7 @@ inline string cachePath() {
     return p + "\\resolve-cache.json";
 }
 
-constexpr long long CACHE_LAYOUT_VERSION = 4;
+constexpr long long CACHE_LAYOUT_VERSION = 7;
 struct CacheKey { u64 textHash = 0; std::size_t textSize = 0; std::uint32_t peChecksum = 0; };
 
 // name -> slot table (one place; the cache and the apply loop share it)
@@ -96,6 +96,12 @@ inline vector<Slot> slotTable() {
         {"WORLD_TO_SCREEN", &kk::off::WORLD_TO_SCREEN},
         {"DO_ACTION", &kk::off::DO_ACTION},
         {"RUNTIME_MODEL_VTABLE", &kk::off::RUNTIME_MODEL_VTABLE},
+        {"MODEL_DATA_VTABLE", &kk::off::MODEL_DATA_VTABLE},
+        {"DYNAMIC_LOC_VTABLE", &kk::off::DYNAMIC_LOC_VTABLE},
+        {"DYNAMIC_LOC_GET_MODEL", &kk::off::DYNAMIC_LOC_GET_MODEL},
+        {"LOC_TAG_TO_ID", &kk::off::LOC_TAG_TO_ID},
+        {"LOC_TYPE_GET", &kk::off::LOC_TYPE_GET},
+        {"LOC_TYPE_NAME", &kk::off::LOC_TYPE_NAME},
         {"RUNTIME_MODEL_CTOR", &kk::off::RUNTIME_MODEL_CTOR},
         {"RUNTIME_MODEL_CLONE", &kk::off::RUNTIME_MODEL_CLONE},
         {"RUNTIME_MODEL_APPLY_ANIM", &kk::off::RUNTIME_MODEL_APPLY_ANIM},
@@ -140,6 +146,37 @@ inline vector<Slot> slotTable() {
         {"SCENE_BASE_Y", &kk::off::SCENE_BASE_Y},
         {"SCENE_NPC_UIDS", &kk::off::SCENE_NPC_UIDS},
         {"SCENE_NPC_UID_COUNT", &kk::off::SCENE_NPC_UID_COUNT},
+        {"SCENE_TILE_DIM_X", &kk::off::SCENE_TILE_DIM_X},
+        {"SCENE_TILE_DIM_Y", &kk::off::SCENE_TILE_DIM_Y},
+        {"SCENE_TILE_GRID", &kk::off::SCENE_TILE_GRID},
+        {"SCENE_TILE_ENTRY_STRIDE", &kk::off::SCENE_TILE_ENTRY_STRIDE},
+        {"SCENE_TILE_OBJECT", &kk::off::SCENE_TILE_OBJECT},
+        {"TILE_GAME_OBJECT_COUNT", &kk::off::TILE_GAME_OBJECT_COUNT},
+        {"TILE_GAME_OBJECTS", &kk::off::TILE_GAME_OBJECTS},
+        {"TILE_BOUNDARY_OBJECT", &kk::off::TILE_BOUNDARY_OBJECT},
+        {"TILE_WALL_DECORATION", &kk::off::TILE_WALL_DECORATION},
+        {"TILE_FLOOR_DECORATION", &kk::off::TILE_FLOOR_DECORATION},
+        {"LOC_FIXED_FINE_X", &kk::off::LOC_FIXED_FINE_X},
+        {"LOC_FIXED_FINE_H", &kk::off::LOC_FIXED_FINE_H},
+        {"LOC_FIXED_FINE_Y", &kk::off::LOC_FIXED_FINE_Y},
+        {"LOC_FIXED_TAG", &kk::off::LOC_FIXED_TAG},
+        {"BOUNDARY_RENDERABLE_A", &kk::off::BOUNDARY_RENDERABLE_A},
+        {"BOUNDARY_RENDERABLE_B", &kk::off::BOUNDARY_RENDERABLE_B},
+        {"WALL_RENDERABLE_A", &kk::off::WALL_RENDERABLE_A},
+        {"WALL_RENDERABLE_B", &kk::off::WALL_RENDERABLE_B},
+        {"FLOOR_RENDERABLE", &kk::off::FLOOR_RENDERABLE},
+        {"GAME_OBJECT_FINE_H", &kk::off::GAME_OBJECT_FINE_H},
+        {"GAME_OBJECT_FINE_X", &kk::off::GAME_OBJECT_FINE_X},
+        {"GAME_OBJECT_FINE_Y", &kk::off::GAME_OBJECT_FINE_Y},
+        {"GAME_OBJECT_TAG", &kk::off::GAME_OBJECT_TAG},
+        {"GAME_OBJECT_PLANE", &kk::off::GAME_OBJECT_PLANE},
+        {"GAME_OBJECT_START_X", &kk::off::GAME_OBJECT_START_X},
+        {"GAME_OBJECT_END_X", &kk::off::GAME_OBJECT_END_X},
+        {"GAME_OBJECT_START_Y", &kk::off::GAME_OBJECT_START_Y},
+        {"GAME_OBJECT_END_Y", &kk::off::GAME_OBJECT_END_Y},
+        {"GAME_OBJECT_RENDERABLE", &kk::off::GAME_OBJECT_RENDERABLE},
+        {"GAME_OBJECT_RENDER_CONTROL", &kk::off::GAME_OBJECT_RENDER_CONTROL},
+        {"GAME_OBJECT_RENDER_OBJECT", &kk::off::GAME_OBJECT_RENDER_OBJECT},
         {"ENTITY_SCENE_X", &kk::off::ENTITY_SCENE_X},
         {"ENTITY_SCENE_Y", &kk::off::ENTITY_SCENE_Y},
         {"ENTITY_FINE_H", &kk::off::ENTITY_FINE_H},
@@ -205,6 +242,9 @@ inline bool validateRuntimeModelLayout(const ModuleMap& M, vector<string>& lines
     namespace off = kk::off;
     auto clear = [&]() {
         off::RUNTIME_MODEL_VTABLE = off::RUNTIME_MODEL_CTOR = 0;
+        off::MODEL_DATA_VTABLE = off::DYNAMIC_LOC_VTABLE = 0;
+        off::DYNAMIC_LOC_GET_MODEL = off::LOC_TAG_TO_ID = 0;
+        off::LOC_TYPE_GET = off::LOC_TYPE_NAME = 0;
         off::RUNTIME_MODEL_CLONE = off::RUNTIME_MODEL_APPLY_ANIM = 0;
         off::RUNTIME_MODEL_TRANSFORM = off::RUNTIME_MODEL_INVALIDATE = 0;
         off::RUNTIME_MODEL_SCALE = 0;
@@ -222,6 +262,8 @@ inline bool validateRuntimeModelLayout(const ModuleMap& M, vector<string>& lines
                     "RuntimeModel acquisition validation failed");
         layout::set(layout::Field::PlayerCurrentModel, layout::State::Unavailable,
                     "Player model acquisition is not proven");
+        layout::set(layout::Field::LocRenderableDispatch, layout::State::Unavailable,
+                    "Loc renderable dispatch validation failed");
     };
     auto fail = [&](const char* why) {
         lines.push_back(string("MODEL-FAIL ") + why);
@@ -259,6 +301,95 @@ inline bool validateRuntimeModelLayout(const ModuleMap& M, vector<string>& lines
     return true;
 }
 
+inline bool validateLocObjectLayout(const ModuleMap& M, vector<string>& lines) {
+    namespace off = kk::off;
+    auto fail = [&](const char* why) {
+        lines.push_back(string("LOC-FAIL   ") + why);
+        off::MODEL_DATA_VTABLE = off::DYNAMIC_LOC_VTABLE = 0;
+        off::DYNAMIC_LOC_GET_MODEL = off::LOC_TAG_TO_ID = 0;
+        off::LOC_TYPE_GET = off::LOC_TYPE_NAME = 0;
+        off::SCENE_TILE_DIM_X = off::SCENE_TILE_DIM_Y = off::SCENE_TILE_GRID = 0;
+        off::SCENE_TILE_ENTRY_STRIDE = off::SCENE_TILE_OBJECT = 0;
+        off::TILE_GAME_OBJECT_COUNT = off::TILE_GAME_OBJECTS = 0;
+        off::TILE_BOUNDARY_OBJECT = off::TILE_WALL_DECORATION = off::TILE_FLOOR_DECORATION = 0;
+        off::LOC_FIXED_FINE_X = off::LOC_FIXED_FINE_H = off::LOC_FIXED_FINE_Y = off::LOC_FIXED_TAG = 0;
+        off::BOUNDARY_RENDERABLE_A = off::BOUNDARY_RENDERABLE_B = 0;
+        off::WALL_RENDERABLE_A = off::WALL_RENDERABLE_B = off::FLOOR_RENDERABLE = 0;
+        off::GAME_OBJECT_FINE_H = off::GAME_OBJECT_FINE_X = off::GAME_OBJECT_FINE_Y = 0;
+        off::GAME_OBJECT_TAG = off::GAME_OBJECT_PLANE = 0;
+        off::GAME_OBJECT_START_X = off::GAME_OBJECT_END_X = 0;
+        off::GAME_OBJECT_START_Y = off::GAME_OBJECT_END_Y = 0;
+        off::GAME_OBJECT_RENDERABLE = off::GAME_OBJECT_RENDER_CONTROL = off::GAME_OBJECT_RENDER_OBJECT = 0;
+        layout::set(layout::Field::LocScene, layout::State::Unavailable, why);
+        layout::set(layout::Field::LocRenderableDispatch, layout::State::Unavailable, why);
+        return false;
+    };
+    auto readPtr = [&](uptr a) -> uptr { uptr v = 0; return pe::safeReadVal(a, v) ? v : 0; };
+
+    if (!off::MODEL_DATA_VTABLE || !M.isRdata(M.base + off::MODEL_DATA_VTABLE))
+        return fail("ModelData vtable absent/outside .rdata");
+    if (!off::DYNAMIC_LOC_VTABLE || !M.isRdata(M.base + off::DYNAMIC_LOC_VTABLE))
+        return fail("DynamicLoc vtable absent/outside .rdata");
+    if (!off::DYNAMIC_LOC_GET_MODEL || !M.isText(M.base + off::DYNAMIC_LOC_GET_MODEL))
+        return fail("DynamicLoc get-model target is not executable");
+    if (!off::LOC_TAG_TO_ID || !M.isText(M.base + off::LOC_TAG_TO_ID))
+        return fail("Loc tag-to-id helper is not executable");
+    if (!off::LOC_TYPE_GET || !M.isText(M.base + off::LOC_TYPE_GET))
+        return fail("LocType loader is not executable");
+    if (off::LOC_TYPE_NAME != 0x40)
+        return fail("unexpected LocType name offset");
+
+    const uptr dynSlot0 = readPtr(M.base + off::DYNAMIC_LOC_VTABLE);
+    if (dynSlot0 != M.base + off::DYNAMIC_LOC_GET_MODEL)
+        return fail("DynamicLoc slot 0 does not match get-model");
+    const uptr modelDataToModel = readPtr(M.base + off::MODEL_DATA_VTABLE + 0x70);
+    if (!modelDataToModel || !M.isText(modelDataToModel))
+        return fail("ModelData +0x70 conversion slot is not executable");
+
+    if (off::SCENE_TILE_DIM_X != 0x948 || off::SCENE_TILE_DIM_Y != 0x94C ||
+        off::SCENE_TILE_GRID != 0x968 || off::SCENE_TILE_ENTRY_STRIDE != 0x10 ||
+        off::SCENE_TILE_OBJECT != 0x8 || off::TILE_GAME_OBJECT_COUNT != 0x34 ||
+        off::TILE_GAME_OBJECTS != 0x38 || off::TILE_BOUNDARY_OBJECT != 0x108 ||
+        off::TILE_WALL_DECORATION != 0x110 || off::TILE_FLOOR_DECORATION != 0x118)
+        return fail("unexpected SceneTile storage layout");
+
+    if (off::LOC_FIXED_FINE_X != 0x28 || off::LOC_FIXED_FINE_H != 0x2C ||
+        off::LOC_FIXED_FINE_Y != 0x30 || off::LOC_FIXED_TAG != 0x38 ||
+        off::BOUNDARY_RENDERABLE_A != 0x220 || off::BOUNDARY_RENDERABLE_B != 0x400 ||
+        off::WALL_RENDERABLE_A != 0x228 || off::WALL_RENDERABLE_B != 0x408 ||
+        off::FLOOR_RENDERABLE != 0x210)
+        return fail("unexpected fixed Loc record/renderable layout");
+
+    if (off::GAME_OBJECT_FINE_H != 0x1D8 || off::GAME_OBJECT_FINE_X != 0x1DC ||
+        off::GAME_OBJECT_FINE_Y != 0x1E0 || off::GAME_OBJECT_TAG != 0x1F0 ||
+        off::GAME_OBJECT_PLANE != 0x1F8 || off::GAME_OBJECT_START_X != 0x210 ||
+        off::GAME_OBJECT_END_X != 0x214 || off::GAME_OBJECT_START_Y != 0x218 ||
+        off::GAME_OBJECT_END_Y != 0x21C || off::GAME_OBJECT_RENDERABLE != 0x230 ||
+        off::GAME_OBJECT_RENDER_CONTROL != 0x240 || off::GAME_OBJECT_RENDER_OBJECT != 0x248)
+        return fail("unexpected GameObject layout");
+
+    // If the scene already exists, validate the two dimensions live. During early
+    // startup it normally does not, so absence is not a failure.
+    if (off::CLIENT_OBJ_PTR && off::SCENE) {
+        const uptr c = readPtr(M.base + off::CLIENT_OBJ_PTR);
+        const uptr scene = c ? readPtr(c + off::SCENE) : 0;
+        if (scene) {
+            i32 sx = 0, sy = 0;
+            if (!pe::safeReadVal(scene + off::SCENE_TILE_DIM_X, sx) ||
+                !pe::safeReadVal(scene + off::SCENE_TILE_DIM_Y, sy) ||
+                sx != 104 || sy != 104)
+                return fail("live scene dimensions are not 104x104");
+        }
+    }
+
+    layout::set(layout::Field::LocScene, layout::State::Validated,
+                "exact 240-7 SceneTile/GameObject layout");
+    layout::set(layout::Field::LocRenderableDispatch, layout::State::Validated,
+                "RuntimeModel/ModelData/DynamicLoc vtable dispatch");
+    lines.push_back("LOC-OK     Scene loc storage + renderable dispatch validated");
+    return true;
+}
+
 inline bool cacheLoad(const CacheKey& k, vector<string>& lines) {
     FILE* f = std::fopen(cachePath().c_str(), "rb");
     if (!f) return false;
@@ -289,7 +420,12 @@ inline bool cacheLoad(const CacheKey& k, vector<string>& lines) {
     // Older resolver builds accidentally cached WORLD_TO_SCREEN as an absolute VA while
     // consumers correctly add the host module base. Reject that cache shape and force one
     // fresh scan; otherwise the indirect call would jump outside the game image.
-    if (!kk::off::CLIENT_OBJ_PTR || !kk::off::GAME_STATE ||
+    // Reject cache files that cannot support the core world snapshot.  Version 6 could
+    // be written after early live validation had zeroed SCENE while the login/scene
+    // transition was still in progress; loading that cache permanently starved every
+    // highlighter of scene data.
+    if (!kk::off::CLIENT_OBJ_PTR || !kk::off::GAME_STATE || !kk::off::SCENE ||
+        !kk::off::REGISTRY_GROUPS || !kk::off::REGISTRY_GROUP_COUNT ||
         (kk::off::WORLD_TO_SCREEN && kk::off::WORLD_TO_SCREEN >= k.textSize)) return false;
     // The cache is only written after a complete scan, so these are semantic
     // capabilities, not merely nonzero numbers. Live validation below may still
@@ -406,16 +542,27 @@ inline void validateLive(uptr base, vector<std::string>& out) {
             off::GAME_STATE = off::CYCLE = 0;
             fail("GAME_STATE out of range -- zeroed (state tracking disabled)");
         } else {
+            layout::set(layout::Field::GameState, layout::State::Validated,
+                        "live GAME_STATE value is in the known state set");
             out.push_back("LIVE-OK   GAME_STATE = " + detail::dec(gs));
         }
     }
     if (off::REGISTRY_GROUPS) {
         const uptr groups = rdp(c + off::REGISTRY_GROUPS);
         const u64 gcount = off::REGISTRY_GROUP_COUNT ? rdq(c + off::REGISTRY_GROUP_COUNT) : 0;
-        if (!groups || gcount < 1 || gcount > 64) {
+        // A zero/null registry is a normal early-startup state.  The offsets are static
+        // layout, while the pointed-to data is runtime state; do not destroy a verified
+        // layout because the client has not populated the registry yet.
+        if (!groups && gcount == 0) {
+            out.push_back("LIVE      registry not populated yet -- keeping layout");
+        } else if (!groups || gcount < 1 || gcount > 64) {
             off::REGISTRY_GROUPS = off::REGISTRY_GROUP_COUNT = off::REGISTRY_MAP = 0;
-            fail("registry groups/count implausible -- zeroed (entity walk disabled)");
+            layout::set(layout::Field::Registry, layout::State::Unavailable,
+                        "live registry structure is inconsistent");
+            fail("registry groups/count structurally inconsistent -- zeroed (entity walk disabled)");
         } else {
+            layout::set(layout::Field::Registry, layout::State::Validated,
+                        "live registry groups/count plausible");
             out.push_back("LIVE-OK   registry: groups@" + detail::hex(off::REGISTRY_GROUPS) +
                           " count=" + detail::dec((long long)gcount));
         }
@@ -468,10 +615,14 @@ inline void validateLive(uptr base, vector<std::string>& out) {
         }
     }
     if (off::SCENE) {
-        const uptr s = rdp(c + off::SCENE);
-        if (!s) {
-            off::SCENE = 0;
-            fail("scene pointer null -- zeroed (scene reads disabled)");
+        const uptr scenePtr = rdp(c + off::SCENE);
+        if (!scenePtr) {
+            // Normal before entering the world / while rebuilding a scene.  SCENE is a
+            // field displacement, not the scene pointer itself, so null runtime state is
+            // not evidence that the displacement is wrong.  Keep it for later frames.
+            out.push_back("LIVE      scene pointer null/not built yet -- keeping SCENE layout");
+        } else {
+            out.push_back("LIVE-OK   scene pointer readable");
         }
     }
 }
@@ -503,6 +654,12 @@ inline bool init(uptr base) {
                         "per-build cache: RuntimeModel geometry");
             layout::set(layout::Field::NpcCurrentModel, layout::State::Resolved,
                         "per-build cache: NPC actor model bridge");
+        }
+        if (detail::validateLocObjectLayout(M, lines)) {
+            layout::set(layout::Field::LocScene, layout::State::Resolved,
+                        "per-build cache: scene Loc storage");
+            layout::set(layout::Field::LocRenderableDispatch, layout::State::Resolved,
+                        "per-build cache: Loc renderable dispatch");
         }
         validateLive(base, lines);
         reportLines(lines);
@@ -889,6 +1046,27 @@ inline bool init(uptr base) {
     // A different client still fails closed and must resolve these fields afresh.
     if (M.textHash == 0x55039211DBE7211BULL && M.textSize == 0xB1516FULL &&
         M.peChecksum == 0xF45167U) {
+        // Core world roots for the exact verified 240-7 image.  These are static
+        // client-object displacements.  Do not make their semantic availability depend
+        // on whether the login/scene transition happened to be complete at resolver init.
+        off::SCENE                = 0xCA90;
+        off::LOCAL_PLAYER_IDX     = 0xCC5C;
+        off::PLAYER_COUNT         = 0xCCE0;
+        off::PLAYER_IDS           = 0xCCE4;
+        off::GAME_STATE           = 0x2160;
+        off::CYCLE                = 0x2164;
+        off::REGISTRY_MAP         = 0xC9C8;
+        off::REGISTRY_GROUPS      = 0xC9E8;
+        off::REGISTRY_GROUP_COUNT = 0xC9F0;
+        off::SCENE_BASE_X         = 0x24;
+        off::SCENE_BASE_Y         = 0x28;
+
+        layout::set(layout::Field::GameState, layout::State::Validated,
+                    "exact 240-7 client state layout");
+        layout::set(layout::Field::Registry, layout::State::Validated,
+                    "exact 240-7 registry layout");
+        lines.push_back("COMPAT    exact 240-7 core scene/registry roots restored");
+
         if (!off::ENTITY_SCENE_X || !off::ENTITY_SCENE_Y) {
             off::ENTITY_SCENE_X = 0x3F0;
             off::ENTITY_SCENE_Y = 0x418;
@@ -905,6 +1083,12 @@ inline bool init(uptr base) {
         // These are RVAs, never absolute IDA VAs. Object fields below are
         // displacements and must not be rebased by consumers.
         off::RUNTIME_MODEL_VTABLE     = 0xBFE358;
+        off::MODEL_DATA_VTABLE        = 0xBFE600;
+        off::DYNAMIC_LOC_VTABLE       = 0xBFE9A0;
+        off::DYNAMIC_LOC_GET_MODEL    = 0x63D150;
+        off::LOC_TAG_TO_ID            = 0x652590;
+        off::LOC_TYPE_GET              = 0x5EF090;
+        off::LOC_TYPE_NAME             = 0x40;
         off::RUNTIME_MODEL_CTOR       = 0x660140;
         off::RUNTIME_MODEL_CLONE      = 0x641F80;
         off::RUNTIME_MODEL_APPLY_ANIM = 0x642960;
@@ -925,7 +1109,40 @@ inline bool init(uptr base) {
         off::MANAGED_DESTROY_VTABLE = 0x8;
         off::MANAGED_DELETE_VTABLE = 0x10;
         off::NPC_MODEL_ENTRY_SLOT = 0;
-        lines.push_back("COMPAT    exact 240-7 RuntimeModel values installed as RVAs");
+
+        off::SCENE_TILE_DIM_X = 0x948;
+        off::SCENE_TILE_DIM_Y = 0x94C;
+        off::SCENE_TILE_GRID = 0x968;
+        off::SCENE_TILE_ENTRY_STRIDE = 0x10;
+        off::SCENE_TILE_OBJECT = 0x8;
+        off::TILE_GAME_OBJECT_COUNT = 0x34;
+        off::TILE_GAME_OBJECTS = 0x38;
+        off::TILE_BOUNDARY_OBJECT = 0x108;
+        off::TILE_WALL_DECORATION = 0x110;
+        off::TILE_FLOOR_DECORATION = 0x118;
+        off::LOC_FIXED_FINE_X = 0x28;
+        off::LOC_FIXED_FINE_H = 0x2C;
+        off::LOC_FIXED_FINE_Y = 0x30;
+        off::LOC_FIXED_TAG = 0x38;
+        off::BOUNDARY_RENDERABLE_A = 0x220;
+        off::BOUNDARY_RENDERABLE_B = 0x400;
+        off::WALL_RENDERABLE_A = 0x228;
+        off::WALL_RENDERABLE_B = 0x408;
+        off::FLOOR_RENDERABLE = 0x210;
+        off::GAME_OBJECT_FINE_H = 0x1D8;
+        off::GAME_OBJECT_FINE_X = 0x1DC;
+        off::GAME_OBJECT_FINE_Y = 0x1E0;
+        off::GAME_OBJECT_TAG = 0x1F0;
+        off::GAME_OBJECT_PLANE = 0x1F8;
+        off::GAME_OBJECT_START_X = 0x210;
+        off::GAME_OBJECT_END_X = 0x214;
+        off::GAME_OBJECT_START_Y = 0x218;
+        off::GAME_OBJECT_END_Y = 0x21C;
+        off::GAME_OBJECT_RENDERABLE = 0x230;
+        off::GAME_OBJECT_RENDER_CONTROL = 0x240;
+        off::GAME_OBJECT_RENDER_OBJECT = 0x248;
+
+        lines.push_back("COMPAT    exact 240-7 RuntimeModel + Loc scene values installed as RVAs/fields");
         if (detail::validateRuntimeModelLayout(M, lines)) {
             // The same actor virtual entry is used by the proven NPC path. Player
             // acquisition remains disabled until a player-side call path is
@@ -933,6 +1150,7 @@ inline bool init(uptr base) {
             layout::set(layout::Field::NpcCurrentModel, layout::State::Validated,
                         "240-7 NPC actor model bridge + managed release path");
         }
+        detail::validateLocObjectLayout(M, lines);
     }
 
     // ---- install: live-validate, cache, report ------------------------------
